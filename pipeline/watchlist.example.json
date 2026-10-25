@@ -1,0 +1,21 @@
+{
+  "_help": "Copy to data/watchlist.json and list your own stocks. india: NSE tickers (fundamentals from screener.in). other: stockanalysis.com paths for US and Korean stocks. market: exchange overrides (KR for KRX, TW for a Taiwanese company's US listing). cyclical: stocks valued on cycle-adjusted earnings. notes: per-company flags shown on its page.",
+  "india": [
+    "RELIANCE",
+    "TCS",
+    "INFY",
+    "ITC"
+  ],
+  "other": {
+    "MSFT": "stocks/msft",
+    "KO": "stocks/ko",
+    "000660": "quote/krx/000660"
+  },
+  "market": {
+    "000660": "KR"
+  },
+  "cyclical": [
+    "000660"
+  ],
+  "notes": {}
+}
