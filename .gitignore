@@ -1,0 +1,23 @@
+# Private: your database, stock list, company notes, prices, logs, backups and caches never leave your Mac
+data/*
+!data/supabase_schema.sql
+!data/supabase_collector.sql
+archive/
+reports/
+*.db
+*.db-*
+*.log
+
+# Generated
+web/app.js
+web/claims.js
+build/
+__pycache__/
+*.pyc
+
+# Local tools and environments
+.venv/
+tools/
+node_modules/
+.DS_Store
+.claude/
