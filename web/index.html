@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>KUBER</title>
+<link rel="icon" href="/favicon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="#/"><img src="/kuber-logo.png" alt="" width="30" height="30">KUBER</a>
+  <nav class="nav" aria-label="Main">
+    <a href="#/" data-r="home">Overview</a>
+    <a href="#/live" data-r="live">Live</a>
+    <a href="#/bonds" data-r="bonds">Bonds</a>
+    <a href="#/orders" data-r="orders">Orders</a>
+    <a href="#/simulate" data-r="simulate">Simulator</a>
+    <a href="#/finder" data-r="finder">Finder</a>
+    <a href="#/notes" data-r="notes">Notes</a>
+    <a href="#/algo" data-r="algo">Algorithms</a>
+    <a href="#/learn" data-r="learn">Learning</a>
+    <a href="#/trial" data-r="trial">Trial</a>
+    <a href="#/model" data-r="model">Accuracy</a>
+    <a href="#/system" data-r="system">System</a>
+  </nav>
+  <div class="mkt" id="mkt" aria-label="Market status"></div>
+  <div class="search"><label for="qs" class="sr">Search companies</label><input id="qs" type="search" placeholder="Search companies…" autocomplete="off"><div class="sres" id="qsr" hidden></div></div>
+  <button class="btn sm" id="theme" aria-label="Switch light or dark theme">Theme</button>
+  <button class="btn sm" id="lockb" aria-label="Lock KUBER">Lock</button>
+</div>
+  <div class="ticker" id="ticker" aria-label="Live prices"><div class="ticker-track" id="tickt"></div></div>
+</header>
+<main class="wrap" id="main"><p class="muted">Starting KUBER…</p></main>
+<footer class="wrap foot">KUBER runs on this Mac. Prices: exchange feed, verified against filings-based sources. Fundamentals: screener.in and stockanalysis.com. Model output is statistical, validated on past data, and is not investment advice.</footer>
+<script src="/vendor/three.min.js"></script>
+<script src="/model.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
