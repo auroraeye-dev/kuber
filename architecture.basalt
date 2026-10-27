@@ -1,0 +1,94 @@
+// @lens: sde
+title: KUBER Research Engine
+summary: Local market research and forecasting
+
+zone "Frontend" [color: blue, pos: 1026,651, size: 774,296] {
+  Desktop App Host [icon: swift, pos: 1283,815]
+  Research Web UI [icon: html, pos: 1475,714]
+  Stochastic Model Library [icon: javascript, pos: 1667,726]
+  Application Assets [icon: image, pos: 1283,721]
+  Desktop Icon Set [icon: image, pos: 1089,849]
+}
+
+zone "Backend" [color: purple, pos: 1988,345, size: 774,503] {
+  Local Engine HTTP Server [icon: nodejs, pos: 2053,564]
+  SQLite Storage Layer [icon: database, pos: 2629,559]
+  Market Data Module [icon: nodejs, pos: 2437,501]
+  Forecast Engine [icon: nodejs, pos: 2245,604]
+  Learning Worker Threads [icon: nodejs, pos: 2437,616]
+  Bond Analysis Module [icon: nodejs, pos: 2245,437]
+  Data Quality Health Module [icon: nodejs, pos: 2245,716]
+  Optional Cloud Sync Module [icon: nodejs, pos: 2437,393]
+}
+
+zone "Data" [color: green, pos: 2928,647, size: 390,379] {
+  Local Research Database [icon: sqlite, pos: 2993,894]
+  Local Data Files [icon: database, pos: 3185,695]
+  Cloud Collector Schema [icon: sql, pos: 2993,800]
+  Optional Cloud Collector [icon: database, pos: 3185,789]
+}
+
+zone "Platform & DevOps" [color: orange, pos: 418,603, size: 398,423] {
+  Page Source Modules [icon: javascript, pos: 483,883]
+  Page Assembly Script [icon: python, pos: 683,883]
+  Setup and Test Scripts [icon: terminal, pos: 483,794]
+  Launchd Schedulers [icon: launchd, pos: 683,662]
+  Fundamentals Data Pipeline [icon: python, pos: 683,756]
+}
+
+zone "External Data Sources" [color: yellow, pos: 12,12, size: 218,932] {
+  NSE Bhavcopy [icon: internet, pos: 87,624]
+  StockAnalysis Market Data [icon: internet, pos: 87,812]
+  Yahoo Finance Backup [icon: internet, pos: 87,530]
+  Screener Fundamentals [icon: internet, pos: 87,718]
+  US Treasury Curves [icon: internet, pos: 87,248]
+  Federal Reserve H.15 [icon: internet]
+  New York Fed Data [icon: internet, pos: 87,154]
+  CCIL Bond Curves [icon: internet, pos: 87,60]
+  RBI Policy Rates [icon: internet, pos: 87,436]
+  CNBC Live Yields [icon: internet, pos: 87,342]
+}
+
+Desktop Icon Set > Desktop App Host [conduit: bundled assets]
+Application Assets > Research Web UI [conduit: static assets]
+Desktop App Host > Research Web UI [conduit: WKWebView]
+Research Web UI > Local Engine HTTP Server [conduit: HTTP]
+Local Engine HTTP Server > Research Web UI [conduit: SSE]
+Research Web UI > Stochastic Model Library [conduit: in-process]
+Stochastic Model Library > Forecast Engine [conduit: shared module]
+
+Local Engine HTTP Server > SQLite Storage Layer [conduit: in-process]
+Local Engine HTTP Server > Market Data Module [conduit: in-process]
+Local Engine HTTP Server > Forecast Engine [conduit: in-process]
+Local Engine HTTP Server > Bond Analysis Module [conduit: in-process]
+Local Engine HTTP Server > Data Quality Health Module [conduit: scheduled]
+Market Data Module > SQLite Storage Layer [conduit: SQL]
+Forecast Engine > SQLite Storage Layer [conduit: SQL]
+Forecast Engine > Learning Worker Threads [conduit: worker threads]
+Learning Worker Threads > SQLite Storage Layer [conduit: SQL]
+Bond Analysis Module > SQLite Storage Layer [conduit: SQL]
+Data Quality Health Module > Desktop App Host [conduit: native notification]
+Optional Cloud Sync Module > SQLite Storage Layer [conduit: SQL]
+Optional Cloud Sync Module > Optional Cloud Collector [conduit: HTTPS]
+SQLite Storage Layer > Local Research Database [conduit: SQL]
+Cloud Collector Schema > Optional Cloud Collector [conduit: schema migration]
+
+Page Source Modules > Page Assembly Script [conduit: build input]
+Page Assembly Script > Research Web UI [conduit: generated app.js]
+Launchd Schedulers > Local Engine HTTP Server [conduit: scheduled launch]
+Setup and Test Scripts > Fundamentals Data Pipeline [conduit: command]
+Setup and Test Scripts > Bond Analysis Module [conduit: bond maths test]
+Setup and Test Scripts > Local Research Database [conduit: read-only self-test]
+Local Data Files > Fundamentals Data Pipeline [conduit: watchlist input]
+Fundamentals Data Pipeline > SQLite Storage Layer [conduit: SQL import]
+
+NSE Bhavcopy > Market Data Module [conduit: HTTPS]
+StockAnalysis Market Data > Market Data Module [conduit: HTTPS]
+Yahoo Finance Backup > Market Data Module [conduit: HTTPS]
+Screener Fundamentals > Fundamentals Data Pipeline [conduit: HTTPS]
+StockAnalysis Market Data > Fundamentals Data Pipeline [conduit: HTTPS]
+US Treasury Curves > Bond Analysis Module [conduit: HTTPS]
+New York Fed Data > Bond Analysis Module [conduit: HTTPS]
+CCIL Bond Curves > Bond Analysis Module [conduit: HTTPS]
+RBI Policy Rates > Bond Analysis Module [conduit: HTTPS]
+CNBC Live Yields > Bond Analysis Module [conduit: HTTPS]
