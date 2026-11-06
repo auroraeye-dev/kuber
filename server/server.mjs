@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import { ROOT, all, get, run, tx, log, now, getSetting, setSetting } from "./db.mjs";
 import { STATE, loadBase, company, trackedIds, runVerification, heldIds, orderCid } from "./companies.mjs";
-import { feedSymbol, syncDaily, quote, ticksToday, saPath, dailySeries, adjustedDaily } from "./market.mjs";
+import { feedSymbol, syncDaily, quote, ticksToday, saPath, dailySeries, adjustedDaily, mcCode } from "./market.mjs";
 import { Q, activeParams, activateParams, analyseLive, makeAutoPreds, scoreMatured, learn, validate, trackRecord, calibFor, paramsVersion, job, divYield, endOfDay, prune, makeLadder, scoreLadder, ladderView, trialCompare, trialGuard, confirmClose, rescoreRecent, realisedDay, officialCloses, reanchor } from "./engine.mjs";
 import * as CLOUD from "./cloud.mjs";
 import * as BACKUP from "./backup.mjs";
@@ -15,6 +15,7 @@ import * as ARCHIVE from "./archive.mjs";
 import * as HEALTH from "./health.mjs";
 import * as LLM from "./llm.mjs";
 import * as BONDS from "./bonds.mjs";
+import * as PF from "./portfolio.mjs";
 
 const PORT = +(process.env.KUBER_PORT || 8777);
 loadBase(); importNews();
@@ -59,7 +60,7 @@ async function poll(id) {
     if (q.quality?.ok === false) return;
     q.fetchedAt = Date.now(); STATE.live[sym] = q;
     if (!prev || prev.price !== q.price) broadcast("quote", { id, sym, price: q.price, chg: q.chg, time: q.time, open: q.open });
-    if (!q.open && prev?.open) { log("market", `${id}: session closed at ${q.price}; end-of-day run in 20 minutes, once the official close has settled`); setTimeout(() => endOfDay(id).then(r => { if (r) { broadcast("refresh", { reason: "eod", id }); if (r.nS) learn().then(() => broadcast("learn", { at: now() })).catch(e => log("learn", e.message)); } }).catch(e => log("eod", e.stack)), 20 * 60e3); }
+    if (!q.open && prev?.open) { log("market", `${id}: session closed at ${q.price}; end-of-day run in 20 minutes, once the official close has settled`); setTimeout(() => poll(id).then(() => endOfDay(id)).then(r => { if (r) { broadcast("refresh", { reason: "eod", id }); if (r.nS) learn().then(() => broadcast("learn", { at: now() })).catch(e => log("learn", e.message)); } }).catch(e => log("eod", e.stack)), 20 * 60e3); }
   } catch (e) { log("feed", e.message); }
 }
 // The source refreshes each quote about once a minute. KUBER learns each stock's refresh second from the quote
@@ -70,7 +71,10 @@ let lastTickAt = Date.now();
 async function tick() {
   // a long gap between ticks means the Mac was asleep: catch up from the cloud and run missed end-of-day steps
   const gap = Date.now() - lastTickAt; lastTickAt = Date.now();
-  if (gap > 5 * 60e3) { log("power", `Mac woke after ${Math.round(gap / 60e3)} minutes asleep: catching up`); maintenance("wake").catch(e => log("maint", e.message)); }
+  if (gap > 5 * 60e3) { log("power", `Mac woke after ${Math.round(gap / 60e3)} minutes asleep: catching up`); HEALTH.noteWake();
+    // macOS wakes a sleeping Mac every ~15 minutes for a moment. A full run on each of those was cut off by the next sleep
+    // (5 Nov 2026: timeouts, retries, slow backups). Pull the cloud's prices every time; do the full run at most hourly.
+    const lastFull = getSetting("maint.last"); if (!lastFull || Date.now() - Date.parse(lastFull) > 60 * 60e3) maintenance("wake").catch(e => log("maint", e.message)); else cloudCatchUp("wake").catch(e => log("cloud", "collector catch-up failed: " + e.message)); }
   if (ticking) return; ticking = true;
   try {
     const open = markets(), ids = trackedIds(), f = focused(), t0 = Date.now(), cOf = id => STATE.base[id] || company(id), mkOf = id => { const c = cOf(id); return c ? (c.mk === "TW" ? "US" : c.mk) : null; };
@@ -98,7 +102,9 @@ setInterval(keepAwake, 60000); setTimeout(keepAwake, 5000);
 // cloud collector: keep its stock list current, then pull in prices the Mac missed and refresh those days' realised volatility
 async function cloudCatchUp(reason) {
   if (!(await CLOUD.collectorAvailable())) return null;
-  const list = trackedIds().map(id => STATE.base[id] || company(id)).filter(Boolean).map(c => ({ sym: feedSymbol(c), path: saPath(c), mk: c.mk === "TW" ? "US" : c.mk }));
+  const list = trackedIds().map(id => STATE.base[id] || company(id)).filter(Boolean).map(c => ({ c, sym: feedSymbol(c), path: saPath(c), mk: c.mk === "TW" ? "US" : c.mk }));
+  // NSE stocks also carry their Moneycontrol code: the cloud asks Moneycontrol too, so a stale main source can't leave gaps
+  for (const x of list) if (x.mk === "IN") x.mc = await mcCode(x.c.tk).catch(() => null);
   await CLOUD.pushSymbols(list);
   const r = await CLOUD.pullTicks();
   for (const t of r.touched || []) { const c = list.find(x => x.sym === t.sym); if (!c) continue; const id = trackedIds().find(i => feedSymbol(STATE.base[i] || company(i)) === t.sym), co = id && (STATE.base[id] || company(id)); if (!co) continue;
@@ -116,7 +122,7 @@ async function maintenance(reason) {
   if (maintRunning) return; maintRunning = true;
   try {
     await cloudCatchUp(reason).catch(e => log("cloud", "collector catch-up failed: " + e.message));
-    bondsCycle(reason).catch(e => log("bonds", e.message));
+    const bondsDone = bondsCycle(reason).catch(e => log("bonds", e.message));   // runs alongside the stock steps; the self-test below waits for it
     for (const id of heldIds()) if (!STATE.base[id] && !get("SELECT 1 AS x FROM catalog WHERE key=? AND status='ready'", id)) await CATALOG.ensure(id).catch(e => log("finder", e.message));
     for (const w of all("SELECT key FROM watch")) if (!get("SELECT 1 AS x FROM catalog WHERE key=? AND status='ready'", w.key)) await CATALOG.ensure(w.key).catch(e => log("finder", e.message));
     for (const id of trackedIds()) {
@@ -128,6 +134,8 @@ async function maintenance(reason) {
     }
     // catch up on any trading day whose end-of-day step didn't run (engine was off at the close)
     for (const id of trackedIds()) { const c = STATE.base[id] || company(id); if (c && !open_(c)) await endOfDay(id, "catch-up").catch(e => log("eod", e.message)); }
+    // closed markets aren't polled: refresh the quote confirmClose compares with, or it keeps the one from just after the bell
+    await Promise.all(trackedIds().filter(id => { const c = STATE.base[id] || company(id); return c && c.mk !== "IN" && !open_(c); }).map(poll));
     for (const id of trackedIds()) { const c = STATE.base[id] || company(id); if (c) confirmClose(c); }
     await officialCloses().catch(e => log("data", "official closes: " + e.message));
     reanchor();
@@ -141,11 +149,16 @@ async function maintenance(reason) {
     const st = await LLM.status(); if (st.running) await LLM.scoreNews(id => (STATE.base[id] || {}).nm || id, 40);
     broadcast("refresh", { reason, preds: nP, scored: nS });
     setSetting("maint.last", now()); log("maint", `Maintenance (${reason}): ${nP} forecasts logged, ${nS} scored`);
-    // self-test after every maintenance: any failure becomes an alert (banner + notification)
-    execSelfTest();
+    // self-test after every maintenance: any failure becomes an alert (banner + notification). It waits for the bond
+    // cycle: after a long shutdown, new Treasury data with the analysis still being rebuilt is not a fault (15 min cap)
+    const pfDone = PF.portfolioCycle(reason).then(() => broadcast("portfolio", {})).catch(e => log("portfolio", e.message));
+    Promise.race([bondsDone.then(() => pfDone), new Promise(r => setTimeout(r, 15 * 60e3))]).then(() => execSelfTest());
   } finally { maintRunning = false; }
 }
 setTimeout(() => maintenance("startup").catch(e => log("maint", e.stack)), 1500);
+// portfolio: re-simulate when a new close or a changed holding appears; your alert rules are checked every minute
+setInterval(() => PF.refreshPortfolio("new close or holding").then(n => { if (n) broadcast("portfolio", {}); }).catch(e => log("portfolio", e.message)), 20 * 60e3);
+setInterval(() => { try { PF.checkRules(); } catch (e) { log("rule", e.message); } }, 60e3);
 
 // ── bond market ──────────────────────────────────────────────────────────
 // live yields every 30 s while US Treasuries or Indian G-secs trade (every 15 minutes otherwise, to keep the last
@@ -187,7 +200,7 @@ setInterval(() => {
 }, 20 * 60e3);
 setInterval(() => { try { HEALTH.check(); broadcast("alerts", HEALTH.active()); } catch (e) { log("health", e.message); } }, 5 * 60e3);
 // the cloud collector should run every minute while a tracked market is open
-setInterval(async () => { try { if (!Object.values(markets()).some(Boolean) || !(await CLOUD.collectorAvailable())) return HEALTH.setAlert("collector", null); const st = await CLOUD.collectorStatus(), age = st?.lastRun ? (Date.now() - Date.parse(st.lastRun)) / 60e3 : Infinity;
+setInterval(async () => { try { if (!trackedIds().some(id => { const c = STATE.base[id] || company(id); return c && marketOpen(c.mk === "TW" ? "US" : c.mk); }) || !(await CLOUD.collectorAvailable())) return HEALTH.setAlert("collector", null); const st = await CLOUD.collectorStatus(), age = st?.lastRun ? (Date.now() - Date.parse(st.lastRun)) / 60e3 : Infinity;
   HEALTH.setAlert("collector", age > 10 ? `Cloud collector hasn't recorded for ${isFinite(age) ? Math.round(age) + " minutes" : "this session"} while a market is open` : st?.failed > 0 && st?.stored === 0 ? `Cloud collector requests are failing (${st.failed} failed in its last run)` : null); } catch (e) { log("health", "collector check: " + e.message); } }, 5 * 60e3);
 setTimeout(() => { try { HEALTH.check(); } catch (e) { log("health", e.message); } }, 10 * 60e3);
 // the 3-month trial starts on the first day the control arm exists
@@ -222,7 +235,7 @@ const SEC = { "x-frame-options": "DENY", "x-content-type-options": "nosniff", "r
   "content-security-policy": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'" };
 const send = (res, code, body, type = "application/json") => { res.writeHead(code, { "content-type": type, "cache-control": "no-store", ...SEC }); res.end(typeof body === "string" || Buffer.isBuffer(body) ? body : JSON.stringify(body)); };
 const body = req => new Promise((res, rej) => { let s = ""; req.on("data", d => { s += d; if (s.length > 5e6) req.destroy(); }); req.on("end", () => { try { res(s ? JSON.parse(s) : {}); } catch (e) { rej(e); } }); });
-const COLLS = { orders: ["orders", ["id", "date", "sym", "mk", "name", "kind", "side", "qty", "price", "status", "note", "source", "created"]] };
+const COLLS = { orders: ["orders", ["id", "date", "sym", "mk", "name", "kind", "side", "qty", "price", "status", "note", "source", "created", "fees"]] };
 function listColl(name) {
   if (name === "orders") return all("SELECT * FROM orders ORDER BY date DESC, id");
   if (name === "notes") return all("SELECT data FROM notes ORDER BY updated DESC").map(r => JSON.parse(r.data));
@@ -231,7 +244,7 @@ function listColl(name) {
 }
 function putColl(name, o) {
   const id = o.id || Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4); o.id = id;
-  if (name === "orders") run("INSERT INTO orders(id,date,sym,mk,name,kind,side,qty,price,status,note,source,created) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET date=excluded.date, sym=excluded.sym, mk=excluded.mk, name=excluded.name, kind=excluded.kind, side=excluded.side, qty=excluded.qty, price=excluded.price, status=excluded.status, note=excluded.note", id, o.date, o.sym, ["IN", "US", "KR"].includes(o.mk) ? o.mk : "IN", o.name, o.kind, o.side, +o.qty, +o.price, o.status, o.note || "", o.source || "manual", o.created || now());
+  if (name === "orders") run("INSERT INTO orders(id,date,sym,mk,name,kind,side,qty,price,status,note,source,created,fees) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET date=excluded.date, sym=excluded.sym, mk=excluded.mk, name=excluded.name, kind=excluded.kind, side=excluded.side, qty=excluded.qty, price=excluded.price, status=excluded.status, note=excluded.note, fees=excluded.fees", id, o.date, o.sym, ["IN", "US", "KR"].includes(o.mk) ? o.mk : "IN", o.name, o.kind, o.side, +o.qty, +o.price, o.status, o.note || "", o.source || "manual", o.created || now(), o.fees === "" || o.fees == null ? null : +o.fees);
   else if (name === "notes") run("INSERT INTO notes(id,updated,data) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET updated=excluded.updated, data=excluded.data", id, o.updated || now(), JSON.stringify(o));
   else if (name === "sims") run("INSERT INTO sims(id,cid,end_date,status,created,data) VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data, status=excluded.status", id, o.cid, o.end, o.status || "pending", o.created || now(), JSON.stringify({ ...o, status: o.status || "pending" }));
   else if (name === "watch") run("INSERT OR IGNORE INTO watch(key,added) VALUES(?,?)", o.key, now());
@@ -306,9 +319,13 @@ const server = http.createServer(async (req, res) => {
           const cid = orderCid(b.mk, b.sym);
           if (STATE.base[cid] && (!b.name || b.name === b.sym)) b.name = STATE.base[cid].nm;
           if (!STATE.base[cid]) { try { const st = await CATALOG.ensure(cid, b.name); if (!b.name || b.name === b.sym) b.name = st?.name || b.sym; if (!get("SELECT 1 AS x FROM eod WHERE sym=?", feedSymbol({ id: cid, mk: b.mk, tk: b.sym }))) fresh = cid; } catch (e) { return send(res, 400, { error: `Couldn't find ${EX} symbol ${b.sym}: ${e.message}. Check the symbol and the market.` }); } } }
+        const why = name === "orders" ? b.why : null, review = name === "orders" ? b.review : null; if (name === "orders") { delete b.why; delete b.review; }
         const nid = putColl(name, b); if (name === "sims") scoreMatured();
+        // every order you enter gets a journal entry: your reason and what KUBER's forecast said at that moment
+        if (name === "orders" && (b.source === "manual" || why || review)) { try { PF.journalOrder(b, why, review); } catch (e) { log("journal", e.message); } }
+        if (name === "orders") setTimeout(() => PF.refreshPortfolio("order changed").then(() => broadcast("portfolio", {})).catch(e => log("portfolio", e.message)), 1500);
         if (fresh) endOfDay(fresh, "catch-up").catch(e => log("eod", e.message)); broadcast("data", { coll: name }); return send(res, 200, { id: nid }); }
-      if (M === "DELETE") { delColl(name, decodeURIComponent(id)); broadcast("data", { coll: name }); return send(res, 200, { ok: true }); }
+      if (M === "DELETE") { delColl(name, decodeURIComponent(id)); if (name === "orders") { run("DELETE FROM journal WHERE order_id=?", decodeURIComponent(id)); setTimeout(() => PF.refreshPortfolio("order changed").then(() => broadcast("portfolio", {})).catch(e => log("portfolio", e.message)), 1500); } broadcast("data", { coll: name }); return send(res, 200, { ok: true }); }
     }
     if (p === "/api/params" && M === "GET") return send(res, 200, { params: Q.getParams(), defaults: Q.DEFAULT_PARAMS, version: paramsVersion(), history: all("SELECT id, ts, note, active, metrics FROM params_history ORDER BY id DESC LIMIT 30") });
     if (p === "/api/params/validate" && M === "POST") { const b = await body(req); return send(res, 200, await validate(b.params)); }
@@ -397,6 +414,18 @@ const server = http.createServer(async (req, res) => {
       const ladder = all("SELECT cid, COUNT(DISTINCT made) runs, COUNT(*) days, SUM(scored IS NOT NULL) scored, AVG(CASE WHEN scored IS NOT NULL THEN in90 END) in90, AVG(CASE WHEN scored IS NOT NULL THEN in50 END) in50, MIN(made) first, MAX(made) last FROM ladder GROUP BY cid");
       return send(res, 200, { rows, names, cur, ladder });
     }
+    // portfolio risk, true profit, what-if, trade plans, rules, journal, daily brief, research
+    if (p === "/api/portfolio" && M === "GET") return send(res, 200, { views: Object.fromEntries(all("SELECT * FROM port_view").map(v => [v.book, { ...JSON.parse(v.data), at: v.at }])), record: PF.portfolioRecord(), ledger: PF.ledger(), costs: PF.getCosts() });
+    if (p === "/api/portfolio/refresh" && M === "POST") { PF.refreshPortfolio("manual", { force: true }).then(() => broadcast("portfolio", {})).catch(e => log("portfolio", e.message)); return send(res, 200, { ok: true }); }
+    if (p === "/api/portfolio/whatif" && M === "POST") { try { return send(res, 200, await PF.whatIfTrade(await body(req))); } catch (e) { return send(res, 400, { error: e.message }); } }
+    if (p === "/api/portfolio/tradeplan" && M === "POST") { try { return send(res, 200, await PF.tradePlan(await body(req))); } catch (e) { return send(res, 400, { error: e.message }); } }
+    if (p === "/api/costs" && M === "POST") { return send(res, 200, PF.setCosts(await body(req))); }
+    if (p === "/api/today" && M === "GET") return send(res, 200, PF.brief());
+    if (p === "/api/rules" && M === "POST") { try { return send(res, 200, { id: PF.saveRule(await body(req)) }); } catch (e) { return send(res, 400, { error: e.message }); } }
+    if (p.startsWith("/api/rules/") && M === "DELETE") { run("DELETE FROM alert_rules WHERE id=?", decodeURIComponent(p.slice(11))); return send(res, 200, { ok: true }); }
+    if (p === "/api/journal" && M === "GET") return send(res, 200, PF.journalList());
+    if (p.startsWith("/api/journal/") && M === "POST") { PF.journalReview(decodeURIComponent(p.slice(13)), await body(req)); return send(res, 200, { ok: true }); }
+    if (p === "/api/research" && M === "GET") return send(res, 200, { tails: getSetting("research.tails"), naive: PF.naiveCompare() });
     if (p === "/api/bonds" && M === "GET") {
       const checks = all("SELECT name, ok, detail, ts FROM bond_checks WHERE id IN (SELECT MAX(id) FROM bond_checks GROUP BY name) ORDER BY name");
       return send(res, 200, { live: BONDS.BSTATE.live, session: { US: BONDS.bondSession("US"), IN: BONDS.bondSession("IN") }, lastFetch: BONDS.BSTATE.lastFetch, lastOk: BONDS.BSTATE.lastOk, lastError: BONDS.BSTATE.lastError, analysing: !!BONDS.BSTATE.analysing, analysis: BONDS.analysisOut(), checks, sync: getSetting("bonds.sync"), meta: getSetting("bonds.analysis") });
@@ -418,4 +447,7 @@ const server = http.createServer(async (req, res) => {
     return send(res, 200, fs.readFileSync(fp), MIME[path.extname(fp)] || "application/octet-stream");
   } catch (e) { log("http", `${M} ${p}: ${e.stack}`); return send(res, 500, { error: e.message }); }
 });
+// a second engine started while one is already serving (app + login service): retry quietly, then leave without a crash trace
+let listenTries = 0;
+server.on("error", e => { if (e.code !== "EADDRINUSE") throw e; if (++listenTries <= 6) return setTimeout(() => server.listen(PORT, "127.0.0.1"), 2500); console.log(`KUBER: port ${PORT} is already in use by another engine; this copy is exiting`); process.exit(0); });
 server.listen(PORT, "127.0.0.1", () => { console.log(`KUBER running at http://127.0.0.1:${PORT}`); log("start", `Server started on port ${PORT}`); });
