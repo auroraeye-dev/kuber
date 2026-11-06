@@ -47,7 +47,7 @@ sim=sim.replace(' Weekly closing prices; dividends not included.', '')
 comp=rep(comp,'<span class="muted small">screener.in, computed from reported figures</span></header><div class="body">','<span class="muted small">screener.in, computed automatically from reported figures (can include one-time items)</span></header><div class="body">${c.flagNote ? `<p class="note warn small" style="margin-top:0">${esc(c.flagNote)}</p>` : ""}')
 comp=rep(comp,'<div class="k">Bad case (CVaR 95%)</div><div class="v neg">−${(mc.cvar95 * 100).toFixed(0)}%</div><div class="s">average of the worst 5% of paths</div>','<div class="k">Stress test (CVaR 95%)</div><div class="v neg">−${(mc.cvar95 * 100).toFixed(0)}%</div><div class="s">not a forecast: average of the worst 5 in 100 simulated ${H}-week outcomes</div>')
 boot=open("../boot.js").read()
-head=open('app_head.js').read(); pages=open('app_pages.js').read() + '\n' + open('app_bonds.js').read()
+head=open('app_head.js').read(); pages=open('app_pages.js').read() + '\n' + open('app_bonds.js').read() + '\n' + open('app_risk.js').read()
 # v5: the old finder and top search are replaced by on-demand versions in app_pages.js
 comp=rep(comp,'''  if (!c && id && id.includes(":")) {
     if (!UNI) { M.innerHTML = `<p class="muted">Loading company data…</p>`; loadUniverse().then(() => { if (route.name === "company" && route.arg === id) render(); }).catch(() => { M.innerHTML = `<p>Couldn't load the stock list. <a href="#/">Back to overview</a></p>`; }); return; }
@@ -88,5 +88,11 @@ orders=rep(orders,'const pos = portfolio().open.find(p => p.sym === sym);','cons
 orders=rep(orders,'msg.textContent = `Saved: ${o.side} ${o.qty} ${sym} at ₹${o.price.toFixed(2)}.','msg.textContent = `Saved: ${o.side} ${o.qty} ${sym} at ${BOOKS[mk].cur}${o.price.toFixed(2)} (${BOOKS[mk].name} portfolio).')
 orders=rep(orders,'  $("#of2").onclick = e =>','  $("#o-mk").onchange = () => { const mk = $("#o-mk").value; $("#o-cur").textContent = BOOKS[mk].cur; $("#o-syms").innerHTML = symsFor(mk).map(s => `<option value="${esc(s)}">`).join(""); $("#o-sym").placeholder = { IN: "e.g. RELIANCE", US: "e.g. MSFT", KR: "e.g. 000660" }[mk]; };\n  $("#of2").onclick = e =>')
 sim=rep(sim,'function vSim(M) {','function vSim(M) {\n  setTimeout(drawSysSims, 0);   // system simulations (automatic forecasts) below your own log')
+# v7 (Nov 2026): orders capture actual charges, your reason and a review date for the journal
+orders=rep(orders,"""<div class="field"><label for="o-note">Note (optional)</label><input id="o-note" autocomplete="off"></div>""","""<div class="field"><label for="o-note">Note (optional)</label><input id="o-note" autocomplete="off"></div>
+      <div class="field"><label for="o-fees">Actual charges (optional)</label><input id="o-fees" type="number" min="0" step="any" placeholder="estimated if empty"></div>
+      <div class="field"><label for="o-why">Why this trade? (journal)</label><input id="o-why" autocomplete="off" placeholder="your reason, in a line"></div>
+      <div class="field"><label for="o-review">Review on</label><input id="o-review" type="date"><span class="hint">90 days if empty</span></div>""")
+orders=rep(orders,"""note: $("#o-note").value,""","""note: $("#o-note").value, fees: $("#o-fees").value === "" ? null : +$("#o-fees").value, why: $("#o-why").value, review: $("#o-review").value,""")
 out='(() => {\n"use strict";\n'+util+'\n'+head+'\n'+charts+'\n'+web3d+'\n'+home+'\n'+comp+'\n'+orders+'\n'+sim+'\n'+notes+'\n'+model+'\n'+pages+'\n'+boot
 open("../../web/app.js","w").write(out); print(len(out))
