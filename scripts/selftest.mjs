@@ -39,7 +39,7 @@ for (const s of stocks) {
   if (wd !== "Sat" && wd !== "Sun" && m >= SESS[s.mk][0] - 30 && m < SESS[s.mk][1] + 15 && last === today) fail(A, `a ${today} close is stored while that session is still in progress`);
   // official NSE closes applied
   if (s.mk === "IN") for (const o of q("SELECT o.date, o.close, d.close dc FROM official_close o JOIN daily d ON d.sym=o.sym AND d.date=o.date WHERE o.sym=?", s.sym)) if (Math.abs(o.dc / o.close - 1) > 1e-6) fail(A, `${o.date}: stored close ${o.dc} ≠ NSE official ${o.close}`);
-  if (s.mk === "IN") { const miss = q("SELECT date FROM daily WHERE sym=? AND date>=? AND date<? AND date NOT IN (SELECT date FROM official_close WHERE sym=?)", s.sym, "2026-10-13", today, s.sym).map(r => r.date); const h = mins("IN").m; if (miss.length && !(miss.length === 1 && miss[0] === today)) (h > 20 * 60 || miss.some(x => x < today) ? (miss.filter(x => x < today).length ? fail : warn) : warn)(A, `no NSE official close for ${miss.join(", ")}`); }
+  if (s.mk === "IN") { const miss = q("SELECT date FROM daily WHERE sym=? AND date>=? AND date<=? AND date NOT IN (SELECT date FROM official_close WHERE sym=?)", s.sym, "2026-10-13", localDate("IN"), s.sym).map(r => r.date), past = miss.filter(x => x < localDate("IN")); if (past.length) fail(A, `no NSE official close for ${past.join(", ")}`); else if (miss.length && mins("IN").m > 21 * 60) warn(A, `no NSE official close yet for ${miss.join(", ")} (normally published by 21:00 IST)`); }
   // end-of-day + forecasts for the latest completed close
   const done = last < today || afterClose || s.mk !== "IN";
   if (done && !g("SELECT 1 x FROM eod WHERE sym=? AND date=?", s.sym, last)) warn(A, `no end-of-day step for ${last}`);
@@ -66,6 +66,14 @@ const ago = iso => iso ? (Date.now() - Date.parse(iso)) / 3600e3 : Infinity;
 if (ago(st("maint.last")) > 8) fail("engine", `maintenance last ran ${ago(st("maint.last")).toFixed(1)} h ago`);
 if (ago(st("learn.last")) > 30) fail("engine", `learning last ran ${ago(st("learn.last")).toFixed(1)} h ago`);
 if (ago(st("backup.last")?.at) > 30) fail("backup", `last backup ${ago(st("backup.last")?.at).toFixed(1)} h ago`);
+// a failed last attempt, or a recorded backup whose file isn't there or is named for another day (4 Nov: UTC date + local time, pruned as it was written)
+const bl = st("backup.last"), fsm = await import("node:fs"), bdir = st("backup.dir") || (await import("node:os")).homedir() + "/KUBER Backups";
+if (st("backup.error")) fail("backup", `last attempt failed: ${st("backup.error").message}`);
+if (bl?.file && !fsm.existsSync(bdir + "/" + bl.file)) fail("backup", `${bl.file} is recorded as the last backup but isn't in the folder`);
+if (bl?.file && !bl.file.startsWith("kuber-" + new Date(bl.at).toLocaleDateString("en-CA"))) fail("backup", `${bl.file} isn't named for the day it was made (${new Date(bl.at).toLocaleDateString("en-CA")})`);
+// the same close "corrected" again and again for over 12 h: the daily sync and the quote keep overwriting each other (4 Nov: a quote frozen from just after the bell)
+{ const seen = {}; for (const e of q("SELECT ts, msg FROM events WHERE kind='data' AND msg LIKE '%corrected to the final quote%' AND ts >= '2026-11-04T05:00:00Z' AND ts >= datetime('now','-3 days')")) (seen[e.msg] ??= []).push(Date.parse(e.ts));
+  for (const [m, t] of Object.entries(seen)) if (t.length > 1 && Math.max(...t) - Math.min(...t) > 12 * 3600e3) fail("close", `flip-flopping (${t.length} times): ${m}`); }
 const cl = st("cloud"); if (cl?.enabled && ago(cl.lastSync) > 14) fail("cloud", `cloud backup last succeeded ${ago(cl.lastSync).toFixed(1)} h ago`);
 for (const a of q("SELECT msg FROM alerts WHERE resolved IS NULL")) warn("alert", a.msg);
 const nanP = g("SELECT COUNT(*) n FROM analyses WHERE ts > datetime('now','-2 days') AND (median IS NULL OR p05 IS NULL OR vol IS NULL OR median <= 0)").n; if (nanP) fail("analyses", `${nanP} recent analyses with missing numbers`);
@@ -89,6 +97,33 @@ const errs = q("SELECT kind, substr(msg,1,140) m FROM events WHERE ts > ? AND ki
     const an = g("SELECT made, data FROM bond_analysis WHERE market='US'");
     if (an) { const asOf = JSON.parse(an.data).asOf; if (last("UST:10Y") && asOf < last("UST:10Y") && Date.now() - Date.parse(an.made) > 6 * 3600e3) fail("bonds", `analysis is from ${asOf} but Treasury data reaches ${last("UST:10Y")}`); if (Date.now() - Date.parse(an.made) > 30 * 3600e3) fail("bonds", `bond analysis last ran ${((Date.now() - Date.parse(an.made)) / 3600e3).toFixed(0)} h ago`); }
     else if (last("UST:10Y")) warn("bonds", "bond analysis hasn't run yet");
+  }
+}
+// guard (5 Nov 2026): the post-maintenance self-test must wait for the bond cycle, or a restart after a long shutdown raises a false "analysis is from…" alert
+{ const src = (await import("node:fs")).readFileSync(new URL("../server/server.mjs", import.meta.url), "utf8"), a = src.indexOf("async function maintenance("), mt = src.slice(a, src.indexOf('setTimeout(() => maintenance("startup")', a));
+  if (!/const bondsDone = bondsCycle\(/.test(mt) || !/Promise\.race\(\[bondsDone\b[^\n]*execSelfTest\(\)/.test(mt)) fail("selftest", "server.mjs: maintenance() no longer waits for the bond cycle before running the self-test"); }
+// guard (6 Nov 2026): a bhavcopy that isn't published yet must be retried within the evening, not blocked for 6 hours
+{ const src = (await import("node:fs")).readFileSync(new URL("../server/engine.mjs", import.meta.url), "utf8"), a = src.indexOf("export async function officialCloses("), oc = src.slice(a, src.indexOf("export function reanchor(", a));
+  if (!/dates\.forEach\(d => \{ bhavNext\[d\] = Date\.now\(\) \+ 25 \* 60e3; \}\)/.test(oc) || !/if \(bc \|\| [^\n]*bhavNext\[date\] = Date\.now\(\) \+ 6 \* 3600e3/.test(oc)) fail("selftest", "engine.mjs: officialCloses() no longer retries an unpublished bhavcopy within 25 minutes"); }
+// a brief wake must not start a full maintenance run or raise a false capture alert (5 Nov 2026)
+{ const fsm = await import("node:fs"), src = fsm.readFileSync(new URL("../server/server.mjs", import.meta.url), "utf8"), hs = fsm.readFileSync(new URL("../server/health.mjs", import.meta.url), "utf8");
+  if (!/Date\.now\(\) - Date\.parse\(lastFull\) > 60 \* 60e3\) maintenance\("wake"\)/.test(src)) fail("selftest", "server.mjs: wake no longer limits full maintenance to once an hour");
+  if (!/if \(justWoke\) break;/.test(hs)) fail("selftest", "health.mjs: capture alerts no longer wait after a wake");
+  const mk = fsm.readFileSync(new URL("../server/market.mjs", import.meta.url), "utf8"); if (!/function release\(hi\)[^\n]*wakeAll\(\)/.test(mk)) fail("selftest", "market.mjs: request limiter no longer wakes every waiting request (live quotes can stall forever)"); }
+// portfolio: maths tests; logged forecasts well-formed; baseline anchored like its outlook; benchmark, dividends and results dates current
+{
+  const pt = (await import("node:child_process")).spawnSync(process.execPath, [new URL("./porttest.mjs", import.meta.url).pathname], { encoding: "utf8" });
+  if (pt.status !== 0) fail("portfolio", "maths tests failed: " + (pt.stdout || "").split("\n").filter(l => l.startsWith("FAIL")).slice(0, 3).join(" | "));
+  if (g("SELECT 1 x FROM sqlite_master WHERE name='port_sims'")) {
+    const badS = g("SELECT COUNT(*) n FROM port_sims WHERE NOT (p05 <= p25 AND p25 <= p50 AND p50 <= p75 AND p75 <= p95) OR p05 IS NULL").n; if (badS) fail("portfolio", `${badS} malformed portfolio forecasts`);
+    const badN = g("SELECT COUNT(*) n FROM ladder_naive WHERE p05 IS NULL OR p05 <= 0 OR p05 > p25 OR p25 > p50 OR p50 > p75 OR p75 > p95").n; if (badN) fail("baseline", `${badN} malformed baseline rows`);
+    const offN = g("SELECT COUNT(*) n FROM ladder_naive n JOIN ladder_runs r ON r.cid=n.cid AND r.made=n.made WHERE n.h=1 AND abs(n.p0/r.p0-1) > 1e-9 AND r.made < date('now','-1 day')").n; if (offN) warn("baseline", `${offN} baselines anchored differently from their outlook (re-made at next maintenance)`);
+    const earlyS = g("SELECT COUNT(*) n FROM port_sims WHERE scored IS NOT NULL AND actual_date <= made").n; if (earlyS) fail("portfolio", `${earlyS} portfolio forecasts scored against a date before they were made`);
+    const heldQty = q("SELECT COALESCE(mk,'IN') mk, sym, SUM(CASE WHEN side='Buy' THEN qty ELSE -qty END) q FROM orders WHERE status='executed' GROUP BY mk, sym").filter(r => r.q > 1e-9), books = new Set(heldQty.map(r => r.mk));
+    for (const mk of books) { const v = g("SELECT made, at FROM port_view WHERE book=?", mk); if (!v) warn("portfolio", `no simulation yet for the ${mk} portfolio`); else if (Date.now() - Date.parse(v.at) > 4 * 864e5) fail("portfolio", `${mk} portfolio simulation is ${((Date.now() - Date.parse(v.at)) / 864e5).toFixed(0)} days old`); }
+    for (const [sym, name] of [["NIFTYBEES.NS", "Nifty benchmark"], ["SPY", "S&P benchmark"]]) { const d = g("SELECT MAX(date) d FROM daily WHERE sym=?", sym)?.d; if (!d) warn("portfolio", `${name} has no prices yet`); else if ((Date.now() - Date.parse(d)) / 864e5 > 7) warn("portfolio", `${name} last price is ${d}`); }
+    const futD = g("SELECT COUNT(*) n FROM company_events WHERE kind='results' AND date < '2015-01-01'").n; if (futD) warn("portfolio", `${futD} implausibly old results dates`);
+    const orphan = g("SELECT COUNT(*) n FROM journal j WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.id=j.order_id)").n; if (orphan) warn("journal", `${orphan} journal entries without their order`);
   }
 }
 const nF = out.filter(x => x[0] === "FAIL").length, nW = out.length - nF;
