@@ -21,8 +21,21 @@ alter table kuber_cloud_pages enable row level security;
 grant all on kuber_bond_daily, kuber_bond_nss, kuber_bond_sec, kuber_cloud_pages to service_role;
 revoke all on kuber_bond_daily, kuber_bond_nss, kuber_bond_sec, kuber_cloud_pages from anon, authenticated;
 
+-- portfolio backup (Nov 2026): logged portfolio forecasts, dividends, results dates, your rules and decision journal
+alter table if exists kuber_orders add column if not exists fees double precision;
+create table if not exists kuber_port_runs (book text, made text, weights text, result text, created text, primary key (book, made));
+create table if not exists kuber_port_sims (book text, made text, arm text, h int, p05 double precision, p25 double precision, p50 double precision, p75 double precision, p95 double precision, "pUp" double precision, actual double precision, actual_date text, scored text, in50 int, in90 int, qscore double precision, primary key (book, made, arm, h));
+create table if not exists kuber_dividends (sym text, ex_date text, amount double precision, cur text, pay_date text, src text, primary key (sym, ex_date, amount));
+create table if not exists kuber_company_events (cid text, date text, kind text, note text, expected int, src text, primary key (cid, date, kind));
+create table if not exists kuber_alert_rules (id text primary key, kind text, target text, value double precision, note text, active int, created text, fired_at text, fired_msg text);
+create table if not exists kuber_journal (id text primary key, order_id text, cid text, sym text, mk text, side text, date text, reason text, review_date text, snapshot text, reviewed text, verdict text, created text);
+do $$ declare t text; begin foreach t in array array['kuber_port_runs','kuber_port_sims','kuber_dividends','kuber_company_events','kuber_alert_rules','kuber_journal'] loop
+  execute format('alter table %I enable row level security', t); execute format('grant all on %I to service_role', t); execute format('revoke all on %I from anon, authenticated', t); end loop; end $$;
+
 -- stocks to record (maintained by KUBER on the Mac)
 create table if not exists kuber_cloud_symbols (sym text primary key, path text not null, mk text not null, active boolean not null default true, updated timestamptz default now());
+-- (26 Oct 2026) Moneycontrol code of each NSE stock: the backup source when the main one serves stale prices
+alter table kuber_cloud_symbols add column if not exists mc text;
 -- prices recorded in the cloud (kept 30 days; the Mac keeps the long-term copy)
 create table if not exists kuber_cloud_ticks (sym text, ts bigint, price double precision, collected_at timestamptz default now(), primary key (sym, ts));
 create index if not exists kuber_cloud_ticks_ts on kuber_cloud_ticks (ts);
@@ -60,11 +73,11 @@ begin return t::jsonb; exception when others then return null; end $$;
 
 -- every minute: store the answers to the previous minute's requests, then ask for the stocks whose market is open
 create or replace function kuber_collect() returns int language plpgsql security definer set search_path = public, extensions as $$
-declare stored int := 0; failed int := 0; requested int := 0;
+declare stored int := 0; failed int := 0; requested int := 0; n int := 0;
 begin
   with done as (
     select p.sym, p.mk, kuber_try_json(r.content) -> 'data' as d, r.status_code
-    from kuber_cloud_pending p join net._http_response r on r.id = p.request_id where not p.test
+    from kuber_cloud_pending p join net._http_response r on r.id = p.request_id where not p.test and p.mk in ('IN', 'US', 'KR')
   ), ins as (
     insert into kuber_cloud_ticks (sym, ts, price)
     select sym, floor((d ->> 'ts')::numeric / 1000)::bigint, (d ->> 'p')::double precision from done
@@ -84,6 +97,20 @@ begin
       and abs(extract(epoch from now()) - extract(epoch from kuber_try_ts(e ->> 'last_time'))) < 900
     on conflict do nothing returning 1
   ) select stored + count(*) into stored from insb;
+  -- NSE prices from Moneycontrol (backup source): only a fresh quote for the right symbol; every cast guarded, so an
+  -- unexpected answer can never stop the run
+  with m as (
+    select p.sym, kuber_try_json(r.content) -> 'data' as d
+    from kuber_cloud_pending p join net._http_response r on r.id = p.request_id where p.mk = 'INMC' and not p.test and r.status_code = 200
+  ), mm as (
+    select sym, case when (d ->> 'lastupd_epoch') ~ '^[0-9]{9,11}$' then (d ->> 'lastupd_epoch')::bigint end as ts,
+           case when (d ->> 'pricecurrent') ~ '^[0-9]+(\.[0-9]+)?$' then (d ->> 'pricecurrent')::double precision end as price
+    from m where d is not null and (d ->> 'NSEID') = split_part(sym, '.', 1)
+  ), insm as (
+    insert into kuber_cloud_ticks (sym, ts, price)
+    select sym, ts, price from mm where ts is not null and price > 0 and abs(extract(epoch from now()) - ts) < 2700
+    on conflict do nothing returning 1
+  ) select stored + count(*) into stored from insm;
   -- official pages requested by kuber_fetch_pages()
   insert into kuber_cloud_pages (name, at, status, content)
   select p.sym, now(), r.status_code, r.content from kuber_cloud_pending p join net._http_response r on r.id = p.request_id where p.mk = 'PAGE' and not p.test;
@@ -99,6 +126,12 @@ begin
          s.sym, s.mk
   from kuber_cloud_symbols s where s.active and kuber_session_open(s.mk);
   get diagnostics requested = row_count;
+  insert into kuber_cloud_pending (request_id, sym, mk)
+  select net.http_get(url := 'https://priceapi.moneycontrol.com/pricefeed/nse/equitycash/' || s.mc,
+           headers := jsonb_build_object('User-Agent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36', 'Accept', 'application/json'),
+           timeout_milliseconds := 20000), s.sym, 'INMC'
+  from kuber_cloud_symbols s where s.active and s.mk = 'IN' and s.mc is not null and s.mc ~ '^[A-Za-z0-9]+$' and kuber_session_open('IN');
+  get diagnostics n = row_count; requested := requested + n;
   if kuber_bond_hours() then
     insert into kuber_cloud_pending (request_id, sym, mk)
     select net.http_get(url := 'https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol?symbols=US1M%7CUS3M%7CUS6M%7CUS1Y%7CUS2Y%7CUS3Y%7CUS5Y%7CUS7Y%7CUS10Y%7CUS20Y%7CUS30Y%7CIN10Y%7CIN30Y&requestMethod=itv&noform=1&partnerId=2&fund=1&exthrs=1&output=json',
