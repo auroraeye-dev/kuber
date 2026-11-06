@@ -113,7 +113,7 @@ def sa_rows(html):
     return s, rows
 
 def stockanalysis(path, full=True):
-    """path like 'stocks/nvda' or 'quote/krx/000660'"""
+    """path like 'stocks/msft' or 'quote/krx/000660'"""
     base = f"https://stockanalysis.com/{path}/"
     r = get(base + "statistics/")
     if not r or r.status_code != 200: return None
@@ -186,10 +186,13 @@ def watchlist():
 def core():
     W = watchlist(); CORE_IN, CORE_SA = W["india"], W["other"]
     out = {}
+    # a failed fetch (e.g. no network while the Mac dark-wakes) keeps the company's previous data instead of writing null
+    try: prev = json.loads((OUT / "core.json").read_text())
+    except Exception: prev = {}
     for s in CORE_IN:
-        out[s] = screener(s); print("IN", s, len(out[s]["wk"]) if out[s] else None, flush=True); time.sleep(0.5)
+        out[s] = screener(s) or prev.get(s); print("IN", s, len(out[s]["wk"]) if out[s] else None, flush=True); time.sleep(0.5)
     for k, p in CORE_SA.items():
-        out[k] = stockanalysis(p); print("SA", k, len(out[k]["wk"]) if out[k] else None, flush=True); time.sleep(0.5)
+        out[k] = stockanalysis(p) or prev.get(k); print("SA", k, len(out[k]["wk"]) if out[k] else None, flush=True); time.sleep(0.5)
     out["_collected"] = datetime.datetime.now().isoformat(timespec="minutes")
     (OUT / "core.json").write_text(json.dumps(out, ensure_ascii=False))
 
