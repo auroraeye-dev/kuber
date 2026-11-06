@@ -161,6 +161,10 @@ parentPort.on("message", async ({ id, task, payload }) => {
     else if (task === "learn") out = payload.companies.map(c => learnCompany(c, payload.preds[c.id] || [], payload.params));
     else if (task === "ladder") out = payload.companies.map(c => ladderLearn(c, payload.live[c.id] || [], payload.params, payload.specs[c.id] || null));
     else if (task === "bonds") out = (await import("./bondanalysis.mjs")).analyse(payload);
+    else if (task === "portfolio") out = (await import("./portmath.mjs")).analysePortfolio(payload);
+    else if (task === "whatif") out = (await import("./portmath.mjs")).whatIf(payload);
+    else if (task === "tradeplan") { const PM = await import("./portmath.mjs"), M = PM.buildModel([payload.stock], { win: 756 }); out = M && PM.tradePlan(M, 0, payload.plan); }
+    else if (task === "research") out = (await import("./portmath.mjs")).researchTails(payload.stocks);
     parentPort.postMessage({ id, ok: true, out });
   } catch (e) { parentPort.postMessage({ id, ok: false, error: String(e && e.stack || e) }); }
 });
