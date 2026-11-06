@@ -36,6 +36,18 @@ CREATE TABLE IF NOT EXISTS bond_sec(date TEXT, bucket TEXT, security TEXT, ytm R
 CREATE TABLE IF NOT EXISTS bond_analysis(market TEXT PRIMARY KEY, made TEXT, data TEXT, secs REAL);
 CREATE TABLE IF NOT EXISTS bond_checks(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, name TEXT, ok INTEGER, detail TEXT);
 `);
+// portfolio risk, baseline, your rules and decisions (Nov 2026)
+db.exec(`
+CREATE TABLE IF NOT EXISTS port_runs(book TEXT, made TEXT, weights TEXT, result TEXT, created TEXT, PRIMARY KEY(book, made));
+CREATE TABLE IF NOT EXISTS port_sims(book TEXT, made TEXT, arm TEXT, h INTEGER, p05 REAL, p25 REAL, p50 REAL, p75 REAL, p95 REAL, pUp REAL, actual REAL, actual_date TEXT, scored TEXT, in50 INTEGER, in90 INTEGER, qscore REAL, PRIMARY KEY(book, made, arm, h));
+CREATE TABLE IF NOT EXISTS port_view(book TEXT PRIMARY KEY, made TEXT, hash TEXT, data TEXT, at TEXT);
+CREATE TABLE IF NOT EXISTS ladder_naive(cid TEXT, made TEXT, h INTEGER, p0 REAL, p05 REAL, p25 REAL, p50 REAL, p75 REAL, p95 REAL, pUp REAL, actual REAL, actual_date TEXT, scored TEXT, in50 INTEGER, in90 INTEGER, qscore REAL, PRIMARY KEY(cid, made, h));
+CREATE TABLE IF NOT EXISTS dividends(sym TEXT, ex_date TEXT, amount REAL, cur TEXT, pay_date TEXT, src TEXT, PRIMARY KEY(sym, ex_date, amount));
+CREATE TABLE IF NOT EXISTS company_events(cid TEXT, date TEXT, kind TEXT, note TEXT, expected INTEGER, src TEXT, PRIMARY KEY(cid, date, kind));
+CREATE TABLE IF NOT EXISTS alert_rules(id TEXT PRIMARY KEY, kind TEXT, target TEXT, value REAL, note TEXT, active INTEGER DEFAULT 1, created TEXT, fired_at TEXT, fired_msg TEXT);
+CREATE TABLE IF NOT EXISTS journal(id TEXT PRIMARY KEY, order_id TEXT, cid TEXT, sym TEXT, mk TEXT, side TEXT, date TEXT, reason TEXT, review_date TEXT, snapshot TEXT, reviewed TEXT, verdict TEXT, created TEXT);
+`);
+if (!db.prepare("PRAGMA table_info(orders)").all().some(c => c.name === "fees")) db.exec("ALTER TABLE orders ADD COLUMN fees REAL");   // actual charges from the contract note; empty = estimated
 // adjusted close (dividends, splits) for modelling; raw close stays the exchange price; daily open/high/low for range-based volatility
 // orders carry their market: IN (₹, NSE), US ($), KR (₩); everything recorded before 22 Oct 2026 is Indian
 if (!db.prepare("PRAGMA table_info(orders)").all().some(c => c.name === "mk")) db.exec("ALTER TABLE orders ADD COLUMN mk TEXT NOT NULL DEFAULT 'IN'");
