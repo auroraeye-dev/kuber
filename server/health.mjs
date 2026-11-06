@@ -4,7 +4,7 @@ import fs from "node:fs";
 import { execFile } from "node:child_process";
 import { all, get, run, log, now, getSetting, ROOT } from "./db.mjs";
 import { trackedIds, company, STATE } from "./companies.mjs";
-import { feedSymbol, sessionOpen, tradingToday, minutesIntoSession } from "./market.mjs";
+import { feedSymbol, sessionOpen, tradingToday, minutesIntoSession, FEED } from "./market.mjs";
 import { BSTATE, bondCore } from "./bonds.mjs";
 
 const MIN_FREE = 5e9;   // bytes
@@ -12,7 +12,7 @@ export function diskFree() { try { const s = fs.statfsSync(ROOT); return s.bavai
 export const diskOk = () => { const f = diskFree(); return f == null || f > MIN_FREE; };
 
 const KUBER_APP = "/Applications/KUBER.app";
-function notify(title, msg) {
+export function notify(title, msg) {
   if (getSetting("alerts.notify", true) === false) return;
   const esc = s => String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"').slice(0, 220);
   const osa = () => execFile("/usr/bin/osascript", ["-e", `display notification "${esc(msg)}" with title "${esc(title)}" sound name "Submarine"`], () => {});
@@ -30,10 +30,14 @@ function raise(key, level, msg) {
 function clear(key) { const r = get("SELECT * FROM alerts WHERE key=? AND resolved IS NULL", key); if (r) { run("UPDATE alerts SET resolved=? WHERE key=?", now(), key); log("alert", `resolved: ${r.msg}`); } }
 const hoursSince = iso => iso ? (Date.now() - Date.parse(iso)) / 3600e3 : Infinity;
 
+// right after a sleep the Mac hasn't had time to record or to pull the cloud's prices: silence then is not a capture fault
+let lastWake = 0; export function noteWake() { lastWake = Date.now(); }
+const JUST_WOKE = 10 * 60e3;
 export function check() {
-  const ids = trackedIds(), nowS = Date.now() / 1000;
+  const ids = trackedIds(), nowS = Date.now() / 1000, justWoke = Date.now() - lastWake < JUST_WOKE;
   // 1 live capture: a tracked stock silent for 10+ minutes while its market is open (after the first 15 minutes)
   for (const id of ids) {
+    if (justWoke) break;
     const c = STATE.base[id] || company(id); if (!c) continue; const mk = c.mk === "TW" ? "US" : c.mk, key = "capture:" + id;
     const since = get("SELECT MAX(ts) AS t FROM ticks WHERE sym=?", feedSymbol(c))?.t || 0, intoSession = minutesIntoSession(mk);
     // by the exchange clock (not the source's open/closed flag, which has proved wrong): 15+ minutes into a session and silent for 10+
@@ -59,8 +63,12 @@ export function check() {
   // 5 data quality: many rejected live prices today
   const dq = all("SELECT sym, rejected, accepted FROM dq WHERE date=? AND rejected > 5 AND rejected > accepted * 0.2", new Date().toISOString().slice(0, 10));
   dq.length ? raise("quality", "warning", `Many live prices rejected today for ${dq.map(r => r.sym).join(", ")}; check the System page`) : clear("quality");
+  // 5b the main price source is stale for a market and a backup is supplying live prices (a warning: data keeps flowing)
+  const fb = Object.entries(FEED).filter(([mk]) => sessionOpen(mk));
+  fb.length ? raise("feed-backup", "warning", fb.map(([mk, f]) => `${mk === "IN" ? "NSE" : mk === "KR" ? "KRX" : "US"} prices are coming from ${f.backup} (the main source has been stale since ${new Date(f.since).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: mk === "IN" ? "Asia/Kolkata" : mk === "KR" ? "Asia/Seoul" : "America/New_York" })})`).join("; ")) : clear("feed-backup");
   // 6 bond market: live yields recorded during core hours; the official data current; every cross-check passing
   for (const [mk, series, name] of [["US", "US10Y", "US 10-year"], ["IN", "IN10Y", "India 10-year"]]) {
+    if (justWoke) break;
     const key = "bonds-live:" + mk, last = get("SELECT MAX(ts) AS t FROM bond_ticks WHERE series=?", series)?.t || 0, q = BSTATE.live[series], silent = (nowS - last) / 60;
     if (!bondCore(mk) || process.uptime() < 900 || silent < 15) { clear(key); continue; }
     if (!BSTATE.lastOk || Date.now() - BSTATE.lastOk > 5 * 60e3) raise(key, "problem", `KUBER can't reach the live bond source (${BSTATE.lastError || "no answer"}); ${name} not recorded for ${Math.round(silent)} minutes`);
