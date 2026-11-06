@@ -129,7 +129,7 @@ function render(scrollTop) {
   W = Q.P.score.weights;
   $$(".nav a").forEach(a => a.setAttribute("aria-current", a.dataset.r === route.name || (route.name === "company" && a.dataset.r === "home") ? "page" : "false"));
   const M = $("#main"); M.onclick = null;
-  ({ home: vHome, live: vLive, bonds: vBonds, trial: vTrial, company: vCompany, orders: vOrders, simulate: vSim, finder: vFinder, notes: vNotes, model: vModel, algo: vAlgo, learn: vLearn, system: vSystem }[route.name] || vHome)(M);
+  ({ home: vHome, today: vToday, risk: vRisk, live: vLive, bonds: vBonds, trial: M => vTrial(M).then(() => drawBaseline(M)), company: M => { vCompany(M); if (CO[route.arg]) drawCompanyDates(CO[route.arg]); }, orders: M => { vOrders(M); drawJournal(); }, simulate: M => { vSim(M); drawPlan(); }, finder: vFinder, notes: vNotes, model: vModel, algo: vAlgo, learn: vLearn, system: vSystem }[route.name] || vHome)(M);
   renderStatus(); renderTicker(); renderAlerts();
   if (scrollTop) try { window.scrollTo(0, 0); } catch (e) {}
 }
@@ -149,6 +149,7 @@ function connectLive() {
     if (route.name === "home" && !isTyping()) { clearTimeout(STATE.homeT); STATE.homeT = setTimeout(() => { const k = $("#kpis-live"); if (k) k.innerHTML = kpis(portfolio()); }, 400); }
   });
   ES.addEventListener("analysis", e => { const a = JSON.parse(e.data); (STATE.liveAnalysis[a.cid] ||= []).push(a); if (route.name === "company" && route.arg === a.cid) drawLive(CO[a.cid]); });
+  ES.addEventListener("portfolio", async () => { if (route.name === "risk" && !isTyping()) { try { RK = await api("/api/portfolio"); drawRisk(); } catch (e) { } } });
   ES.addEventListener("bonds", e => { if (route.name === "bonds") onBondEvent(JSON.parse(e.data)); });
   ES.addEventListener("alerts", e => { STATE.alerts = JSON.parse(e.data); renderAlerts(); });
   ES.addEventListener("params", async () => { await reload(); render(); });
