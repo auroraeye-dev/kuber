@@ -8,7 +8,7 @@ function kpis(P) {
     <div class="kpi"><div class="k">Unrealised P&amp;L</div><div class="v ${SHOWPF ? cls(B.unreal) : ""}">${m(B.unreal, true)}</div><div class="s ${SHOWPF ? cls(B.unreal) : ""}">${priv(pct(B.unreal / B.invested, 2))}</div></div>
     <div class="kpi"><div class="k">Realised P&amp;L</div><div class="v ${SHOWPF ? cls(B.realised) : ""}">${m(B.realised, true)}</div><div class="s">closed trades</div></div>
     <div class="kpi"><div class="k">Day change</div><div class="v ${SHOWPF ? cls(B.day) : ""}">${m(B.day, true)}</div><div class="s">vs previous close</div></div>
-    <div class="kpi"><div class="k">XIRR</div><div class="v ${SHOWPF ? cls(B.xirr) : ""}">${priv(fin(B.xirr) ? pct(B.xirr, 1) : "—")}</div><div class="s">annualised, by order dates</div></div></div>`; }).join("");
+    <div class="kpi"><div class="k">XIRR</div><div class="v ${SHOWPF ? cls(B.xirr) : ""}">${priv(fin(B.xirr) ? pct(B.xirr, 1) : "—")}</div><div class="s">annualised, by order dates</div></div></div>`; }).join("") + `<p class="small" style="margin:-6px 0 14px"><a href="#/risk">Portfolio risk, true profit after charges and dividends, and the comparison with the Nifty</a></p>`;
 }
 // Show / hide portfolio amounts (PIN checked by the engine, same PIN and lock-out as the login)
 function pfBar() {
