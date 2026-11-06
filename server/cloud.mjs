@@ -10,7 +10,7 @@ const TABLES = {
   rv: { pk: "sym,date", cols: ["sym", "date", "n_ticks", "n_5m", "rv_5m", "rs_range", "overnight", "close", "model_vol"] },
   preds: { pk: "id", cols: ["id", "cid", "kind", "made", "H", "target", "p0", "median", "p05", "p25", "p75", "p95", "pUp", "kappa", "params_ver", "actual", "actual_date", "scored", "pit", "in50", "in90", "dirHit", "err", "logErr", "iscore"] },
   analyses: { pk: "id", cols: ["id", "cid", "ts", "px", "H", "median", "p05", "p25", "p75", "p95", "pUp", "mu", "vol", "score", "trigger"] },
-  orders: { pk: "id", cols: ["id", "date", "sym", "mk", "name", "kind", "side", "qty", "price", "status", "note", "source", "created"] },
+  orders: { pk: "id", cols: ["id", "date", "sym", "mk", "name", "kind", "side", "qty", "price", "status", "note", "source", "created", "fees"] },
   sims: { pk: "id", cols: ["id", "cid", "end_date", "status", "created", "data"] },
   notes: { pk: "id", cols: ["id", "updated", "data"] },
   stock_models: { pk: "cid", cols: ["cid", "spec", "accepted", "metrics", "updated"] },
@@ -19,7 +19,13 @@ const TABLES = {
   ladder: { pk: "cid,made,h", cols: ["cid", "made", "h", "p0", "p05", "p25", "p50", "p75", "p95", "pUp", "actual", "actual_date", "scored", "in50", "in90", "qscore"] },
   bond_daily: { pk: "series,date", cols: ["series", "date", "y", "src"] },
   bond_nss: { pk: "date", cols: ["date", "b0", "b1", "b2", "b3", "t1", "t2", "src"] },
-  bond_sec: { pk: "date,bucket", cols: ["date", "bucket", "security", "ytm"] }
+  bond_sec: { pk: "date,bucket", cols: ["date", "bucket", "security", "ytm"] },
+  port_runs: { pk: "book,made", cols: ["book", "made", "weights", "result", "created"] },
+  port_sims: { pk: "book,made,arm,h", cols: ["book", "made", "arm", "h", "p05", "p25", "p50", "p75", "p95", "pUp", "actual", "actual_date", "scored", "in50", "in90", "qscore"] },
+  dividends: { pk: "sym,ex_date,amount", cols: ["sym", "ex_date", "amount", "cur", "pay_date", "src"] },
+  company_events: { pk: "cid,date,kind", cols: ["cid", "date", "kind", "note", "expected", "src"] },
+  alert_rules: { pk: "id", cols: ["id", "kind", "target", "value", "note", "active", "created", "fired_at", "fired_msg"] },
+  journal: { pk: "id", cols: ["id", "order_id", "cid", "sym", "mk", "side", "date", "reason", "review_date", "snapshot", "reviewed", "verdict", "created"] }
 };
 import { execFileSync } from "node:child_process";
 // the service-role key lives in the macOS login Keychain (item "KUBER Supabase"), never in the database or its backups
@@ -70,7 +76,7 @@ async function doSync(force) {
     for (let i = 0; i < rows.length; i += 1000) {
       const send = () => req(c, "POST", `kuber_${name}?on_conflict=${T.pk}`, rows.slice(i, i + 1000).map(r => Object.fromEntries(cols.map(k => [k, r[k] ?? null]))));
       // the order market column (added 22 Oct 2026) exists in Supabase only after supabase_collector.sql is re-run; back up the rest until then
-      try { await send(); } catch (e) { if (name !== "orders" || !/\bmk\b/.test(e.message) || cols !== T.cols) throw e; cols = T.cols.filter(k => k !== "mk"); log("cloud", "Supabase has no orders.mk column yet: re-run data/supabase_collector.sql; backing up orders without it"); await send(); }
+      try { await send(); } catch (e) { if (name !== "orders" || !/\b(mk|fees)\b/.test(e.message) || cols !== T.cols) throw e; cols = T.cols.filter(k => k !== "mk" && k !== "fees"); log("cloud", "Supabase is missing a new orders column: re-run data/supabase_collector.sql; backing up orders without it"); await send(); }
     }
     pushed[name] = (pushed[name] || 0) + rows.length;
   };
@@ -93,6 +99,9 @@ async function doSync(force) {
       await push("bond_daily", all("SELECT series, date, y, src FROM bond_daily WHERE date >= ?", bs)); await push("bond_nss", all("SELECT * FROM bond_nss WHERE date >= ?", bs)); await push("bond_sec", all("SELECT * FROM bond_sec WHERE date >= ?", bs));
       wm.bonds = get("SELECT MAX(date) AS d FROM bond_daily WHERE date <= ?", new Date().toISOString().slice(0, 10))?.d || wm.bonds; wm.bondError = null;
     } catch (e) { if (wm.bondError !== e.message.slice(0, 80)) log("cloud", "Bond tables not backed up (run data/supabase_collector.sql in Supabase): " + e.message.slice(0, 160)); wm.bondError = e.message.slice(0, 80); }
+    // portfolio tables (Nov 2026): small, full upsert; exist in Supabase only after supabase_collector.sql is re-run
+    try { for (const t of ["port_runs", "port_sims", "dividends", "company_events", "alert_rules", "journal"]) await push(t, all(`SELECT * FROM ${t}`)); wm.pfError = null; }
+    catch (e) { if (wm.pfError !== e.message.slice(0, 80)) log("cloud", "Portfolio tables not backed up (run data/supabase_collector.sql in Supabase): " + e.message.slice(0, 160)); wm.pfError = e.message.slice(0, 80); }
     setSetting("cloud", { ...getSetting("cloud"), wm, lastSync: now(), lastError: null, pushed });
     log("cloud", `Backed up to Supabase in ${((Date.now() - t0) / 1000).toFixed(1)} s: ${Object.entries(pushed).map(([k, v]) => `${v} ${k}`).join(", ")}`);
     return { ok: true, pushed };
@@ -106,6 +115,8 @@ async function doSync(force) {
 // price the cloud has that the Mac does not. Both read the same source quote (same timestamp), so duplicates
 // collapse on the (sym, ts) key.
 import { run as dbRun, tx as dbTx } from "./db.mjs";
+import { tsInSession } from "./market.mjs";
+const symMarket = s => s.endsWith(".NS") ? "IN" : s.endsWith(".KS") ? "KR" : "US";
 async function getJSON(c, pathq) { const r = await req(c, "GET", pathq); return r.json(); }
 export async function collectorAvailable() {
   const c = cfg(); if (!c?.enabled || !c.key) return false;
@@ -114,8 +125,9 @@ export async function collectorAvailable() {
 // stocks the cloud should record: [{sym, path, mk}]
 export async function pushSymbols(list) {
   const c = cfg(); if (!c?.enabled || !c.key) return { skipped: true };
-  const rows = list.map(x => ({ sym: x.sym, path: x.path, mk: x.mk, active: true, updated: now() }));
-  await req(c, "POST", "kuber_cloud_symbols?on_conflict=sym", rows);
+  let rows = list.map(x => ({ sym: x.sym, path: x.path, mk: x.mk, mc: x.mc ?? null, active: true, updated: now() }));
+  // the mc column exists only after data/supabase_collector.sql (26 Oct 2026) is run; until then send the rest
+  try { await req(c, "POST", "kuber_cloud_symbols?on_conflict=sym", rows); } catch (e) { if (!/\bmc\b/.test(e.message)) throw e; rows = rows.map(({ mc, ...r }) => r); await req(c, "POST", "kuber_cloud_symbols?on_conflict=sym", rows); }
   const keep = new Set(rows.map(r => r.sym)), cur = await getJSON(c, "kuber_cloud_symbols?select=sym,active");
   const stale = cur.filter(r => r.active && !keep.has(r.sym)).map(r => r.sym);
   if (stale.length) await req(c, "PATCH", `kuber_cloud_symbols?sym=in.(${stale.map(encodeURIComponent).join(",")})`, { active: false });
@@ -131,7 +143,7 @@ export async function pullTicks() {
     const rows = await getJSON(c, `kuber_cloud_ticks?select=sym,ts,price&ts=gt.${from}&order=ts.asc,sym.asc&offset=${off}&limit=1000`);
     if (!rows.length) break; seen += rows.length; off += rows.length;
     // bond yields recorded by the cloud arrive as sym "B:<series>" and go to the bond table, not the stock prices
-    dbTx(() => { for (const r of rows) { if (r.sym.startsWith("B:")) { bonds += dbRun("INSERT OR IGNORE INTO bond_ticks(series,ts,y,src) VALUES(?,?,?,?)", r.sym.slice(2), r.ts, r.price, "cloud").changes; if (r.ts > maxTs) maxTs = r.ts; continue; } const ch = dbRun("INSERT OR IGNORE INTO ticks(sym,ts,price) VALUES(?,?,?)", r.sym, r.ts, r.price).changes; if (ch) { added++; const day = new Date(r.ts * 1000).toISOString().slice(0, 10); touched.set(r.sym + "|" + day, { sym: r.sym, ts: r.ts }); } if (r.ts > maxTs) maxTs = r.ts; } });
+    dbTx(() => { for (const r of rows) { if (r.sym.startsWith("B:")) { bonds += dbRun("INSERT OR IGNORE INTO bond_ticks(series,ts,y,src) VALUES(?,?,?,?)", r.sym.slice(2), r.ts, r.price, "cloud").changes; if (r.ts > maxTs) maxTs = r.ts; continue; } if (!tsInSession(symMarket(r.sym), r.ts)) { if (r.ts > maxTs) maxTs = r.ts; continue; } const ch = dbRun("INSERT OR IGNORE INTO ticks(sym,ts,price) VALUES(?,?,?)", r.sym, r.ts, r.price).changes; if (ch) { added++; const day = new Date(r.ts * 1000).toISOString().slice(0, 10); touched.set(r.sym + "|" + day, { sym: r.sym, ts: r.ts }); } if (r.ts > maxTs) maxTs = r.ts; } });
   }
   setSetting("cloud.ticksWm", maxTs);
   if (added) log("cloud", `Pulled ${added} prices from the cloud collector that the Mac missed (${touched.size} stock-days)`);
