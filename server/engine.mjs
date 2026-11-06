@@ -93,7 +93,10 @@ export function confirmClose(c0) {
   if (c0.mk === "IN") return null;
   // only after the session: a thinly traded stock's quote can look "not open" mid-session (no trade for 45+ minutes)
   const mk = c0.mk === "TW" ? "US" : c0.mk;
-  const sym = feedSymbol(c0), L = STATE.live[sym]; if (!L || L.open || sessionOpen(mk) || !L.day || !(L.price > 0)) return null;
+  // only the primary's own post-close quote (status "closed") is the auction close: a backup quote (CNBC) left over
+  // from the session is the last trade before the closing cross (seen 2 Nov 2026 on a large US stock)
+  // and only once settled: the quote taken in the minutes after the bell can still miss the auction (seen 3 Nov 2026 on a large US stock)
+  const sym = feedSymbol(c0), L = STATE.live[sym]; if (!L || L.open || sessionOpen(mk) || !L.day || !(L.price > 0) || L.providerStatus !== "closed" || L.fetchedAt - L.time * 1000 < 15 * 60e3) return null;
   const r = get("SELECT close, adj FROM daily WHERE sym=? AND date=?", sym, L.day); if (!r || Math.abs(L.price / r.close - 1) < 1e-6) return null;
   run("UPDATE daily SET close=?, adj=CASE WHEN adj IS NULL THEN NULL ELSE adj * ? END WHERE sym=? AND date=?", L.price, L.price / r.close, sym, L.day);
   log("data", `${c0.id} ${L.day}: stored close ${r.close} corrected to the final quote ${L.price}`); dailyCache.delete(sym); return { from: r.close, to: L.price };
@@ -101,7 +104,7 @@ export function confirmClose(c0) {
 // self-healing: anything scored against the last 5 days is re-scored from the current (corrected) closes
 export function rescoreRecent(days = 5) {
   const cut = new Date(Date.now() - days * 864e5).toISOString().slice(0, 10); let n = 0;
-  for (const T of ["ladder", "ladder_base"]) n += run(`UPDATE ${T} SET scored=NULL, actual=NULL, actual_date=NULL, in50=NULL, in90=NULL, qscore=NULL WHERE actual_date >= ?`, cut).changes;
+  for (const T of ["ladder", "ladder_base", "ladder_naive"]) n += run(`UPDATE ${T} SET scored=NULL, actual=NULL, actual_date=NULL, in50=NULL, in90=NULL, qscore=NULL WHERE actual_date >= ?`, cut).changes;
   n += run("UPDATE preds SET scored=NULL, actual=NULL, actual_date=NULL WHERE kind='auto' AND actual_date >= ?", cut).changes;
   dailyCache.clear(); return n;
 }
@@ -239,6 +242,8 @@ export function makeLadder(only) {
   return n;
 }
 // score every outlook day whose date has arrived: the close h trading days after the run
+export const scoreNaive = () => { dailyCache.clear(); return scoreTable("ladder_naive"); };   // no-forecast baseline, separate from the trial's two arms
+export const dailyOf = c => dailyFor(c);
 export function scoreLadder() { dailyCache.clear(); return scoreTable("ladder") + scoreTable("ladder_base"); }
 function scoreTable(T) {
   let n = 0;
@@ -271,7 +276,8 @@ export function trialCompare(cid) {
     verdict: rows.length < 200 ? "too early" : dm.t > 2 ? "tuned is better" : dm.t < -2 ? "standard is better" : "no clear difference" };
 }
 export function trialGuard() {
-  const off = getSetting("tuning.off", {}) || {}; let changed = 0;
+  // stored as [] on some installs; keys added to an array are dropped by JSON.stringify, so always work on an object
+  const o = getSetting("tuning.off", {}), off = o && !Array.isArray(o) ? o : {}; let changed = 0;
   for (const cid of trackedIds()) { if (off[cid]) continue; const T = trialCompare(cid); if (T.n >= 200 && T.dm.t < -2) { off[cid] = { at: now(), reason: `live: standard model better on ${T.n} paired outlook days (Diebold–Mariano t ${T.dm.t.toFixed(2)})` }; changed++; log("trial", `${cid}: tuning switched off; ${off[cid].reason}`); } }
   if (changed) setSetting("tuning.off", off);
   return changed;
@@ -298,17 +304,23 @@ export function ladderView(cid) {
 // For each of the last NSE trading days without official closes, download NSE's bhavcopy (published each evening),
 // store the official prices for every tracked NSE stock and apply them. If a close moved by more than 0.1%, that
 // day's forecasts and outlooks were anchored to a provisional price: they are re-logged and everything re-scored.
-const bhavTried = {};
+const bhavNext = {};   // date → when to look for its bhavcopy again
 export async function officialCloses() {
   const ids = trackedIds().map(id => company(id, { live: false })).filter(c => c && c.mk === "IN"); if (!ids.length) return 0;
   // every recent day on which any tracked NSE stock lacks its official close (a stock added to the wishlist today needs
   // the past days too: 23 Oct 2026, two stocks added that morning had none because those days were already done for the others)
   const syms = ids.map(c => feedSymbol(c)), since = new Date(Date.now() - 12 * 864e5).toISOString().slice(0, 10);
-  const dates = all(`SELECT DISTINCT d.date FROM daily d WHERE d.sym IN (${syms.map(() => "?").join(",")}) AND d.date >= ? AND NOT EXISTS (SELECT 1 FROM official_close o WHERE o.sym = d.sym AND o.date = d.date) ORDER BY d.date DESC`, ...syms, since).map(r => r.date).filter(d => d !== tradingToday("IN") && !(Date.now() - (bhavTried[d] || 0) < 6 * 3600e3)).slice(0, 10);
-  dates.forEach(d => { bhavTried[d] = Date.now(); });   // a day a stock can't get (holiday file, suspended stock) is retried after 6 hours, not every run
+  const dates = all(`SELECT DISTINCT d.date FROM daily d WHERE d.sym IN (${syms.map(() => "?").join(",")}) AND d.date >= ? AND NOT EXISTS (SELECT 1 FROM official_close o WHERE o.sym = d.sym AND o.date = d.date) ORDER BY d.date DESC`, ...syms, since).map(r => r.date).filter(d => d !== tradingToday("IN") && Date.now() >= (bhavNext[d] || 0)).slice(0, 10);
+  // No file yet (NSE hasn't published, or the network failed during a dark wake): look again in 25 minutes. This was a flat
+  // 6 hours until 6 Nov 2026, so an attempt at 16:30 IST blocked the evening's file until 22:30, and a Mac shut down before
+  // then had no official close that day. 6 hours is only for a file that was read (a suspended stock isn't in it) or a day
+  // over 3 days old with no file (a holiday).
+  dates.forEach(d => { bhavNext[d] = Date.now() + 25 * 60e3; });
   let changed = 0;
   for (const date of dates) {
-    const bc = await nseBhavcopy(date); if (!bc) continue;
+    const bc = await nseBhavcopy(date);
+    if (bc || Date.now() - Date.parse(date) > 3 * 864e5) bhavNext[date] = Date.now() + 6 * 3600e3;
+    if (!bc) continue;
     for (const c of ids) {
       const o = bc[c.tk]; if (!o || !(o.close > 0)) continue; const sym = feedSymbol(c), before = get("SELECT close FROM daily WHERE sym=? AND date=?", sym, date)?.close;
       run("INSERT INTO official_close(sym,date,open,high,low,close,last,source,fetched) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(sym,date) DO UPDATE SET open=excluded.open, high=excluded.high, low=excluded.low, close=excluded.close, last=excluded.last, fetched=excluded.fetched", sym, date, o.open, o.high, o.low, o.close, o.last, "NSE bhavcopy", now());
