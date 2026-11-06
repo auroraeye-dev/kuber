@@ -10,8 +10,9 @@ a method named on the page. It is a research tool, not investment advice.
 ## What it does
 
 - **Live capture** of NSE, NYSE/Nasdaq and KRX stocks during their sessions, with validation before anything is stored
-  (stale quotes, impossible jumps and one-sample bad prints are rejected), and an optional cloud collector (Supabase +
-  `pg_cron`) that keeps recording while the Mac is asleep or off. The Mac reconciles gaps when it wakes.
+  (stale quotes, impossible jumps and one-sample bad prints are rejected), a backup source per market when the main one
+  goes stale, and an optional cloud collector (Supabase + `pg_cron`) that keeps recording while the Mac is asleep or off.
+  The Mac reconciles gaps when it wakes.
 - **Official closes**: NSE closes come from the exchange's bhavcopy; US/KRX closes are confirmed after the session.
   A day in progress is never stored as a close.
 - **Forecasts** for 1, 4 and 13 weeks and a 90-day daily outlook for every stock, logged every trading day and scored
@@ -22,6 +23,16 @@ a method named on the page. It is a research tool, not investment advice.
 - **Bond market**: US Treasuries (official curves since 1990) and Indian government bonds (CCIL's official curve), with
   live yields, curve shape, factor decomposition, term premium, a recession signal, volatility ranges with a 30-year
   walk-forward test, bond maths, and each stock's sensitivity to yields.
+- **Portfolio risk**: all holdings simulated together with their real correlations and shared crash days, logged and
+  scored daily. What-if for a trade before making it, stress tests from the worst real periods and from market and yield
+  shocks, and which holding drives the risk.
+- **True profit**: charges (contract-note figures or estimates), dividends, the same money in a benchmark, and capital
+  gains by financial year (first in, first out).
+- **Trade plans**: hold vs stop/target exits vs staged buying on the same simulated paths, after charges and tax.
+- **Today**: a daily brief, results and dividend dates, your own alert rules, and a decision journal that saves your
+  reason and the forecast at the moment you decided.
+- **Honest baselines**: forecasts are also compared with a no-forecast random walk, and model ideas are tested on past
+  data without touching the live comparison.
 - **Portfolios** per market in their own currency (₹, $, ₩), with amounts hidden until the PIN is entered again.
 - **Self-test** after every maintenance run: data invariants per stock, official-close checks, forecast anchoring,
   bond cross-checks and the maths test suite. Failures raise an alert.
@@ -37,6 +48,7 @@ a method named on the page. It is a research tool, not investment advice.
 | Forecasts | `server/engine.mjs` | Logging, scoring, 90-day outlooks, official closes, re-anchoring, learning orchestration |
 | Learning | `server/worker.mjs` | Heavy maths in worker threads: backtests, per-stock model selection, calibration |
 | Bonds | `server/bonds.mjs`, `bondmath.mjs`, `bondanalysis.mjs` | Sources and cross-checks; pure maths (tested); the analysis |
+| Portfolio | `server/portfolio.mjs`, `portmath.mjs` | Joint simulation, what-if, stress, true profit, tax lots, rules, journal, brief; pure maths (tested) |
 | Health | `server/health.mjs` | Capture, freshness and data-quality alerts; native notifications |
 | Cloud | `server/cloud.mjs`, `data/supabase_*.sql` | Optional backup and the cloud collector |
 | Pages | `scripts/app_src/*` → `web/app.js` | Front end, assembled by `scripts/assemble_app.py` |
@@ -57,11 +69,16 @@ a method named on the page. It is a research tool, not investment advice.
   probit, GARCH + filtered historical simulation ranges with a Kupiec coverage test, exact bond repricing, duration,
   convexity, carry and roll-down, and stock rate sensitivities with Newey–West errors.
 
+- **Portfolio**: per-stock GARCH with residuals drawn by date across all stocks (filtered historical simulation), so
+  correlation and shared crash days stay as they happened; walk-forward test with Kupiec coverage and Diebold–Mariano
+  comparison with a plain bootstrap; variance and tail risk contributions; results-day variance shrunk toward 1.
+
 ## Data sources
 
 Exchange and official data: NSE (bhavcopy), US Treasury (par and real yield curves), Federal Reserve (H.15), New York Fed
 (fed funds, SOFR, ACM term premium, recession model), CCIL (India zero-coupon curve and tenor-wise yields), RBI (policy
-rates). Market data: stockanalysis.com, Yahoo Finance (backup), screener.in (Indian fundamentals), CNBC (live yields).
+rates, NSE board-meeting dates), Nasdaq (US results dates). Market data: stockanalysis.com, Moneycontrol, CNBC and Yahoo
+Finance (backups), screener.in (Indian fundamentals), CNBC (live yields).
 Check each source's terms before any use beyond personal research.
 
 ## Setup (macOS)
@@ -81,5 +98,6 @@ never committed.
 
 ```bash
 node scripts/bondtest.mjs    # bond maths against textbook values, published data and simulations with known answers
+node scripts/porttest.mjs    # portfolio maths: known volatility and correlation, hand-worked tax lots and charges
 node scripts/selftest.mjs    # data invariants on your own database (read-only)
 ```
