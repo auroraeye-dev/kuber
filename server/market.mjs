@@ -4,7 +4,7 @@
 //   verify   NSE: screener.in close (independent of the primary); US/KRX: Yahoo close
 // All requests go through one rate limiter (≥1.5 s apart, long pause after HTTP 429).
 import { execFile } from "node:child_process";
-import { all, get, run, tx, log, now } from "./db.mjs";
+import { all, get, run, tx, log, now, getSetting, setSetting } from "./db.mjs";
 import { withoutSpikes } from "./bondmath.mjs";
 
 const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36";
@@ -17,16 +17,20 @@ async function slot(hi) {
   while (inFlight >= 4 || (!hi && bulk >= 2)) await new Promise(r => (hi ? waitHi : waitLo).push(r));
   inFlight++; if (!hi) bulk++; const w = Math.max(0, nextAt - Date.now()); nextAt = Math.max(Date.now(), nextAt) + 600; if (w) await sleep(w);
 }
-function release(hi) { inFlight = Math.max(0, inFlight - 1); if (!hi) bulk = Math.max(0, bulk - 1); const r = waitHi.shift() || waitLo.shift(); if (r) r(); }
+// a finished request wakes every waiting one and each re-checks whether it may start (live quotes first). Waking only one
+// lost wake-ups: a history download that still couldn't start swallowed it, and live quotes waited forever (26 Oct 2026)
+function release(hi) { inFlight = Math.max(0, inFlight - 1); if (!hi) bulk = Math.max(0, bulk - 1); wakeAll(); }
+function wakeAll() { const w = [...waitHi.splice(0), ...waitLo.splice(0)]; for (const r of w) r(); }
+setInterval(() => { if (inFlight === 0 && (waitHi.length || waitLo.length)) { log("feed", "request queue found waiting with nothing in flight; woken"); wakeAll(); } }, 10000);
 function curl(url) {
   return new Promise((res, rej) => execFile("curl", ["-s", "-m", /history/.test(url) ? "60" : "15", "-A", UA, "-H", "Accept: application/json", "-w", "\n%{http_code}", url], { maxBuffer: 30e6 }, (err, out) => {
     if (err) return rej(err); const i = out.lastIndexOf("\n"); res({ status: +out.slice(i + 1), body: out.slice(0, i) });
   }));
 }
-async function getJSON(url) {
+export async function getJSON(url) {
   const host = new URL(url).host;
   if (pause[host] && Date.now() < pause[host]) throw new Error(`${host} paused after rate limit`);
-  const hi = /\/api\/quotes\//.test(url); await slot(hi);
+  const hi = /\/api\/quotes\/|pricefeed|restQuote/.test(url); await slot(hi);
   let r; try { r = await curl(url); } finally { release(hi); }
   if (r.status === 429) { pause[host] = Date.now() + 5 * 60e3; log("feed", `${host} rate-limited; pausing it for 5 minutes`); throw new Error(`${host} HTTP 429`); }
   if (r.status !== 200) throw new Error(`${host} HTTP ${r.status}`);
@@ -37,12 +41,15 @@ async function getJSON(url) {
 // provider's market-status flag proved wrong for NSE ("closed" on 21 Oct 2026 while quotes were updating)
 const SESS = { IN: ["Asia/Kolkata", 555, 930], US: ["America/New_York", 570, 960], TW: ["America/New_York", 570, 960], KR: ["Asia/Seoul", 540, 930] };
 function localNow(tz) { return Object.fromEntries(new Intl.DateTimeFormat("en-GB", { timeZone: tz, hourCycle: "h23", weekday: "short", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }).formatToParts(new Date()).map(x => [x.type, x.value])); }
+// was this quote time (unix seconds) inside the exchange session? The cloud collector polls from the bell, but its first
+// quote can carry the pre-open/pre-market time (NSE 09:09, US 09:12–09:20; self-test warning 30 Oct 2026)
+export function tsInSession(mk, ts) { const [tz, a, b] = SESS[mk] || SESS.US, p = Object.fromEntries(new Intl.DateTimeFormat("en-GB", { timeZone: tz, hourCycle: "h23", weekday: "short", hour: "2-digit", minute: "2-digit" }).formatToParts(new Date(ts * 1000)).map(x => [x.type, x.value])); if (p.weekday === "Sat" || p.weekday === "Sun") return false; const m = +p.hour * 60 + +p.minute; return m >= a && m <= b; }
 export function sessionOpen(mk) { const [tz, a, b] = SESS[mk] || SESS.US, p = localNow(tz); if (p.weekday === "Sat" || p.weekday === "Sun") return false; const m = +p.hour * 60 + +p.minute; return m >= a && m <= b; }
 // the exchange's local date while a session is in progress (until 15 min after the bell, while the official close settles), else null
 export function minutesIntoSession(mk) { const [tz, a, b] = SESS[mk] || SESS.US, p = localNow(tz); if (p.weekday === "Sat" || p.weekday === "Sun") return -1; const m = +p.hour * 60 + +p.minute; return m >= a && m <= b ? m - a : -1; }
 export function tradingToday(mk) { const [tz, a, b] = SESS[mk] || SESS.US, p = localNow(tz); if (p.weekday === "Sat" || p.weekday === "Sun") return null; const m = +p.hour * 60 + +p.minute; return m >= a - 30 && m < b + 15 ? `${p.year}-${p.month}-${p.day}` : null; }
 export function feedSymbol(c) { if (c.mk === "KR") return c.tk + ".KS"; if (c.mk === "IN") return c.tk + ".NS"; return c.tk.replace(".", "-"); }
-export function saPath(c) { if (c.mk === "KR") return "a/krx-" + c.tk.toLowerCase(); if (c.mk === "IN") return "a/nse-" + c.tk.toLowerCase(); return "s/" + c.tk.toLowerCase(); }
+export function saPath(c) { if (c.path) return c.path; if (c.mk === "KR") return "a/krx-" + c.tk.toLowerCase(); if (c.mk === "IN") return "a/nse-" + c.tk.toLowerCase(); return "s/" + c.tk.toLowerCase(); }
 const ydate = (ts, off) => new Date((ts + off) * 1000).toISOString().slice(0, 10);
 
 // rows: [date, close, volume, adjusted close, open, high, low]. The provider back-adjusts the whole history whenever a
@@ -90,20 +97,63 @@ export async function syncDaily(c, range = "5Y") {
   }
   catch (e1) { try { return { n: storeDaily(sym, done(await yhHistory(c, range === "5Y" ? "5y" : "3mo"))), provider: "Yahoo Finance" }; } catch (e2) { throw new Error(`${c.id}: ${e1.message}; backup: ${e2.message}`); } }
 }
+// Primary: stockanalysis.com. If it fails, or keeps serving an old quote while the exchange is trading (26 Oct 2026:
+// NSE open from 09:15, the primary still on Friday's prices), the market's backup is asked: NSE → Moneycontrol,
+// US → CNBC, KRX → Yahoo. The primary is asked first again on every poll, so KUBER returns to it when it recovers.
+const PRIMARY = "stockanalysis.com";
+export const FEED = {};   // per market: { backup: provider, since } while a backup is in use
+function feedNote(mk, provider) {
+  const cur = FEED[mk];
+  if (provider && !cur) { FEED[mk] = { backup: provider, since: now() }; log("feed", `${mk}: ${PRIMARY} is serving stale or no quotes while the market trades; using ${provider} until it recovers`); }
+  else if (!provider && cur) { log("feed", `${mk}: ${PRIMARY} is current again; switched back from ${cur.backup} (used since ${cur.since.slice(11, 16)} UTC)`); delete FEED[mk]; }
+}
+const mkOf = c => c.mk === "TW" ? "US" : c.mk;
+async function saQuote(c, sym, mk) {
+  const d = (await getJSON(`https://stockanalysis.com/api/quotes/${saPath(c)}`)).data, fresh = Math.abs(Date.now() - d.ts) < 45 * 60e3;   // KRX data from this source can be delayed ~20 min
+  // a thinly traded stock has no trade time until its first trade of the day (seen on a small US stock): that is "no trade yet", not a bad price
+  if (!Number.isFinite(Number(d.ts)) || !(d.ts > 0)) return { sym, price: d.p, prev: d.cl, chg: d.cp, time: null, open: false, noTradeYet: true, providerStatus: d.ms, day: d.td, provider: PRIMARY };
+  // trading = inside the exchange's session by our clock, the quote is for today, and its timestamp is fresh
+  return { sym, price: d.p, prev: d.cl, chg: d.cp, time: Math.round(d.ts / 1000), open: sessionOpen(mk) && fresh && d.td === tradingToday(mk), delaySec: Math.round((Date.now() - d.ts) / 1000), providerStatus: d.ms, day: d.td, provider: PRIMARY };
+}
+const zoneDay = (t, tz) => new Date(t * 1000).toLocaleDateString("en-CA", { timeZone: tz });
+const finish = (q, mk) => { const fresh = q.time && Math.abs(Date.now() / 1000 - q.time) < 45 * 60; q.delaySec = q.time ? Math.round(Date.now() / 1000 - q.time) : null; q.open = !!(sessionOpen(mk) && fresh && q.day === tradingToday(mk)); return q; };
+// NSE via Moneycontrol: its stock code is looked up once per symbol (checked against the NSE symbol it returns)
+export async function mcCode(tk) {
+  const have = getSetting("mc.codes", {}); if (have[tk]) return have[tk];
+  const j = await getJSON(`https://www.moneycontrol.com/mccode/common/autosuggestion_solr.php?classic=true&query=${encodeURIComponent(tk)}&type=1&format=json`);
+  const re = new RegExp(`(^|[\\s,>])${tk.replace(/[.*+?^${}()|[\]\\&]/g, "\\$&")}(,|<|$)`), hit = (Array.isArray(j) ? j : []).find(x => re.test(x.pdt_dis_nm || ""));
+  if (!hit?.sc_id) throw new Error(`Moneycontrol has no code for ${tk}`);
+  setSetting("mc.codes", { ...getSetting("mc.codes", {}), [tk]: hit.sc_id }); return hit.sc_id;
+}
+async function mcQuote(c, sym) {
+  const code = await mcCode(c.tk), d = (await getJSON(`https://priceapi.moneycontrol.com/pricefeed/nse/equitycash/${encodeURIComponent(code)}`)).data;
+  if (!d || d.NSEID !== c.tk) { const all = getSetting("mc.codes", {}); delete all[c.tk]; setSetting("mc.codes", all); throw new Error(`Moneycontrol code ${code} does not belong to ${c.tk}`); }
+  const price = +d.pricecurrent, prev = +d.priceprevclose, t = +d.lastupd_epoch;
+  if (!(price > 0) || !(t > 0)) throw new Error(`Moneycontrol: no price for ${c.tk}`);
+  return finish({ sym, price, prev: prev > 0 ? prev : null, chg: prev > 0 ? (price / prev - 1) * 100 : null, time: t, day: zoneDay(t, "Asia/Kolkata"), provider: "Moneycontrol (NSE)" }, "IN");
+}
+// US via CNBC: during the session last_time carries the trade time; after hours only a date (then not live)
+async function cnbcQuote(c, sym) {
+  const j = await getJSON(`https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol?symbols=${encodeURIComponent(c.tk)}&requestMethod=itv&noform=1&partnerId=2&fund=1&exthrs=1&output=json`);
+  const r = [].concat(j?.FormattedQuoteResult?.FormattedQuote || [])[0]; if (!r || r.symbol !== c.tk) throw new Error(`CNBC: no quote for ${c.tk}`);
+  const num = x => +String(x ?? "").replace(/,/g, ""), price = num(r.last), prev = num(r.previous_day_closing), t = /T/.test(r.last_time || "") ? Date.parse(r.last_time) / 1000 : null;
+  if (!(price > 0)) throw new Error(`CNBC: no price for ${c.tk}`);
+  return finish({ sym, price, prev: prev > 0 ? prev : null, chg: prev > 0 ? (price / prev - 1) * 100 : null, time: t ? Math.round(t) : null, day: t ? zoneDay(t, "America/New_York") : null, provider: "CNBC" }, "US");
+}
+async function yahooQuote(c, sym, mk) {
+  const j = await getJSON(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?range=1d&interval=1m`), m = j?.chart?.result?.[0]?.meta; if (!m) throw new Error(`Yahoo: no quote for ${sym}`);
+  const per = m.currentTradingPeriod?.regular, t = Date.now() / 1000, prev = m.chartPreviousClose ?? m.previousClose;
+  return { sym, price: m.regularMarketPrice, prev, chg: prev ? (m.regularMarketPrice / prev - 1) * 100 : null, time: m.regularMarketTime, open: per ? t >= per.start && t <= per.end : false, day: ydate(m.regularMarketTime, m.gmtoffset || 0), provider: "Yahoo Finance" };
+}
+const backup = (c, sym, mk) => mk === "IN" ? mcQuote(c, sym) : mk === "US" ? cnbcQuote(c, sym) : yahooQuote(c, sym, mk);
 export async function quote(c) {
-  const sym = feedSymbol(c); let q;
-  try {
-    const d = (await getJSON(`https://stockanalysis.com/api/quotes/${saPath(c)}`)).data;
-    const mk = c.mk === "TW" ? "US" : c.mk, fresh = Math.abs(Date.now() - d.ts) < 45 * 60e3;   // KRX data from this source can be delayed ~20 min
-    // a thinly traded stock has no trade time until its first trade of the day (seen on a small US stock): that is "no trade yet", not a bad price
-    if (!Number.isFinite(Number(d.ts)) || !(d.ts > 0)) { q = { sym, price: d.p, prev: d.cl, chg: d.cp, time: null, open: false, noTradeYet: true, providerStatus: d.ms, day: d.td, provider: "stockanalysis.com", quality: { ok: true, why: [] } }; return q; }
-    // trading = inside the exchange's session by our clock, the quote is for today, and its timestamp is fresh
-    q = { sym, price: d.p, prev: d.cl, chg: d.cp, time: Math.round(d.ts / 1000), open: sessionOpen(mk) && fresh && d.td === tradingToday(mk), delaySec: Math.round((Date.now() - d.ts) / 1000), providerStatus: d.ms, day: d.td, provider: "stockanalysis.com" };
-  } catch (e) {
-    const j = await getJSON(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?range=1d&interval=1m`), m = j?.chart?.result?.[0]?.meta; if (!m) throw e;
-    const per = m.currentTradingPeriod?.regular, t = Date.now() / 1000, prev = m.chartPreviousClose ?? m.previousClose;
-    q = { sym, price: m.regularMarketPrice, prev, chg: prev ? (m.regularMarketPrice / prev - 1) * 100 : null, time: m.regularMarketTime, open: per ? t >= per.start && t <= per.end : false, day: ydate(m.regularMarketTime, m.gmtoffset || 0), provider: "Yahoo Finance" };
-  }
+  const sym = feedSymbol(c), mk = mkOf(c); let q = null, err = null;
+  try { q = await saQuote(c, sym, mk); } catch (e) { err = e; }
+  // stale = the session has run 3+ minutes and the primary's quote still isn't today's live price
+  if (!q || (minutesIntoSession(mk) >= 3 && !q.open)) {
+    try { const b = await backup(c, sym, mk); if (b && (b.open || !q)) { q = b; if (b.open) feedNote(mk, b.provider); } } catch (e) { if (!q) throw err || e; }
+  } else if (q.open) feedNote(mk, null);
+  if (!q) throw err;
   q.quality = checkTick(sym, q);
   if (q.quality.ok && q.open) run("INSERT OR IGNORE INTO ticks(sym,ts,price) VALUES(?,?,?)", sym, q.time, q.price);
   return q;
